@@ -6,7 +6,7 @@ hydrator.py is a Python-based program for importing a Lustre
 namespace from an Azure storage account.  Imported files are
 left in the 'released'/'exist' Lustre HSM state once imported into
 Lustre so they can later be hydrated on-demand by a compatible
-copytool.  A copytool is required to hydrate the contents of
+copytool.  A copytool is required to hydrate the file contents
 from the Azure storage account.
 
 ## Supported platforms
