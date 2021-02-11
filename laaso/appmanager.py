@@ -32,14 +32,21 @@ class ManagerMixin():
         except KeyError:
             return dict()
         ret = dict(si)
-        location_defaults = ret.get('location_defaults', dict())
-        location_data = location_defaults.get(az_mgr.location, dict())
-        if location_data:
+        ret.pop('location_default', None)
+        ld_popped = ret.pop('location_defaults', dict())
+        if az_mgr.location:
             ret['location_default'] = az_mgr.location
-            ret['location_defaults'] = {az_mgr.location : location_data}
-        else:
-            ret.pop('location_default', None)
-            ret.pop('location_defaults', None)
+            values = ld_popped.get(az_mgr.location, dict())
+            ldv = self.jinja_filter_data(values)
+            name_substitutions = self.name_substitutions_resolve(ldv.pop('name_substitutions', dict()))
+            if name_substitutions:
+                ldv['name_substitutions'] = name_substitutions
+            if ldv:
+                ret['location_defaults'] = {az_mgr.location :  ldv}
+        name_substitutions = ret.pop('_name_substitutions', dict())
+        name_substitutions = self.name_substitutions_resolve(name_substitutions)
+        if name_substitutions:
+            ret['name_substitutions'] = name_substitutions
         return {'subscription_defaults' : [ret]}
 
     def scfg_dict_generate(self, az_mgr=None, **kwargs):
@@ -73,6 +80,37 @@ class ManagerMixin():
                                         key, val_pre)
                     ret['defaults'].pop(key, None)
 
+        return ret
+
+    def vm_image_exists_for_preflight(self, image_id, az_mgr=None):
+        '''
+        Return whether the given image_id exists. Used during preflighting.
+        Exists as a separate method to allow orchestrating apps
+        to replace this check logic.
+        '''
+        az_mgr = az_mgr or self.az_mgr_generate()
+        image_obj = az_mgr.vm_image_get_by_id(image_id)
+        if not image_obj:
+            self.logger.debug("%s image_id %r does not exist", self.mth(), image_id)
+            return False
+        return True
+
+    def az_mgr_generate(self, **kwargs):
+        '''
+        Generate and return a new Manager (MANAGER_CLASS)
+        '''
+        kg = getattr(self, 'manager_kwargs', None)
+        if callable(kg):
+            mk = kg() # pylint: disable=not-callable
+        else:
+            mk = dict()
+            for k in ('logger', 'subscription_id', 'tenant_id'):
+                try:
+                    mk[k] = getattr(self, k)
+                except AttributeError:
+                    continue
+        mk.update(kwargs)
+        ret = self.MANAGER_CLASS(**mk)
         return ret
 
 class ApplicationWithManager(laaso.common.Application, ManagerMixin):

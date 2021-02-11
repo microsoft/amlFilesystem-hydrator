@@ -12,16 +12,19 @@ Environment variables:
   LAASO_REPO_ROOT - use this as the effective root of the LaaSO repo
   LAASO_SUBSCRIPTION_CONFIG - location of the src/config/testing_subscriptions.yaml equivalent
 '''
+import copy
 import os
 import sys
 import threading
 
 import yaml
 
+import laaso.base_defaults
 from laaso.base_defaults import EXC_VALUE_DEFAULT
 import laaso.onbox
 from laaso.exceptions import (ApplicationExit,
                               RepoRootNotFoundError,
+                              SubscriptionConfigNotFoundError,
                              )
 import laaso.hydratorapp
 import laaso.util
@@ -78,7 +81,7 @@ class Paths():
         # We could be running in the hydrator repo
         if laaso.hydratorapp.HYDRATOR_APP and self.repo_root_hydrator_validate(tmp):
             return '.'
-        in_venv = bool(os.environ.get('VIRTUAL_ENV', ''))
+        in_venv = bool(self.venv)
         if in_venv:
             # We may be in a subdir in the repo. Walk up the tree looking
             # for a valid directory. Do not cross a symlink boundary.
@@ -205,6 +208,19 @@ class Paths():
         return True
 
     ######################################################################
+    # venv
+
+    @property
+    def venv(self):
+        '''
+        Getter for the root of the virtualenv or None if we are not in a virtualenv
+        '''
+        venv = os.environ.get('VIRTUAL_ENV', '')
+        if venv and os.path.isdir(venv):
+            return venv
+        return None
+
+    ######################################################################
     # subscription_config_filename
 
     @property
@@ -238,8 +254,10 @@ class Paths():
                 self._subscription_config_path_set(path)
             return self._subscription_config_path
 
-    CONFIG_DEFAULT_TUPLE = ('src', 'config', 'testing_subscriptions.yaml')
-    CONFIG_DEFAULT_PATH = os.path.join(*CONFIG_DEFAULT_TUPLE)
+    CONFIG_DEFAULT_TUPLE_REPO = ('src', 'config', 'testing_subscriptions.yaml')
+    CONFIG_DEFAULT_PATH_REPO = os.path.join(*CONFIG_DEFAULT_TUPLE_REPO)
+
+    CONFIG_DEFAULT_PATH_ONBOX = '/usr/laaso/etc/laaso_config.yaml'
 
     def _subscription_config_find(self):
         '''
@@ -251,16 +269,16 @@ class Paths():
         if path:
             return path
         if laaso.onbox.ONBOX:
-            path = '/usr/laaso/etc/laaso_config.yaml'
-            if os.path.isfile(path):
+            if os.path.isfile(self.CONFIG_DEFAULT_PATH_ONBOX):
+                return self.CONFIG_DEFAULT_PATH_ONBOX
+        else:
+            try:
+                path = self.repo_root_path(*self.CONFIG_DEFAULT_TUPLE_REPO)
+            except RepoRootNotFoundError:
+                path = None
+            if path and os.path.isfile(path):
                 return path
-        try:
-            path = self.repo_root_path(*self.CONFIG_DEFAULT_TUPLE)
-        except RepoRootNotFoundError:
-            path = None
-        if path and os.path.isfile(path):
-            return path
-        raise ApplicationExit("cannot locate subscription configuration; try setting LAASO_SUBSCRIPTION_CONFIG")
+        raise SubscriptionConfigNotFoundError("cannot locate subscription configuration; try setting LAASO_SUBSCRIPTION_CONFIG")
 
     def _subscription_config_path_set(self, path):
         '''
@@ -277,6 +295,20 @@ class Paths():
     ######################################################################
     # subscription_config_data
 
+    # _scd_cache: cache the parsed contents by filename
+    # This is primarily useful for supporting testing where
+    # we repeatedly reset and reparse.
+    _scd_cache = {} # key=path value=data
+
+    def scd_cache_reset(self):
+        '''
+        Clear the contents of _scd_cache.
+        This is not done as part of the common reset path (laaso.reset_caches())
+        because doing so defeats the purpose of the cache.
+        '''
+        with self._repo_root_lock:
+            self._scd_cache.clear()
+
     @property
     def subscription_config_data(self):
         '''
@@ -286,21 +318,26 @@ class Paths():
             if self._subscription_config_data is not None:
                 assert isinstance(self._subscription_config_data, dict)
                 return self._subscription_config_data
-            try:
-                with open(self.subscription_config_filename, 'r') as f:
-                    contents = f.read()
-            except FileNotFoundError as exc:
-                raise ApplicationExit("subscription config file %r not found" % self.subscription_config_filename) from exc
-            try:
-                data = yaml.safe_load(contents)
-            except yaml.error.MarkedYAMLError as exc:
-                raise ApplicationExit(f"cannot parse {self.subscription_config_filename!r}: error line {exc.problem_mark.line} column {exc.problem_mark.column}") from exc
-            except yaml.error.YAMLError as exc:
-                # yaml.error.YAMLError is more readable with str than repr
-                raise ApplicationExit(f"cannot parse {self.subscription_config_filename!r}: error {exc}") from exc
-            if data is None:
-                # empty file - interpret it as an empty dict
-                data = dict()
+            data = self._scd_cache.get(self.subscription_config_filename, None)
+            if not isinstance(data, dict):
+                try:
+                    with open(self.subscription_config_filename, 'r') as f:
+                        contents = f.read()
+                except FileNotFoundError as exc:
+                    raise SubscriptionConfigNotFoundError("subscription config file %r not found" % self.subscription_config_filename) from exc
+                try:
+                    data = yaml.safe_load(contents)
+                except yaml.error.MarkedYAMLError as exc:
+                    raise ApplicationExit(f"cannot parse {self.subscription_config_filename!r}: error line {exc.problem_mark.line} column {exc.problem_mark.column}") from exc
+                except yaml.error.YAMLError as exc:
+                    # yaml.error.YAMLError is more readable with str than repr
+                    raise ApplicationExit(f"cannot parse {self.subscription_config_filename!r}: error {exc}") from exc
+                if data is None:
+                    # empty file - interpret it as an empty dict
+                    data = dict()
+                self._scd_cache[self.subscription_config_filename] = data
+            # Always force a copy so that the cache never shares a ref with what we use here
+            data = copy.deepcopy(data)
             self._subscription_config_data_set(data)
             return self._subscription_config_data
 
@@ -316,19 +353,72 @@ class Paths():
             self._subscription_config_data = data
 
     ######################################################################
+    # executables
+
+    @staticmethod
+    def is_executable_file(path):
+        '''
+        Return whether the given path is an executable file.
+        '''
+        # We ignore executable bits and declare victory if we find the file.
+        # This is "good enough" at the moment. Permission checks can
+        # be added later if needed.
+        return os.path.isfile(path)
+
+    @classmethod
+    def exe_search(cls, name):
+        '''
+        Search $PATH for a file with the given name.
+        Returns None if not found.
+        '''
+        assert os.path.sep not in name
+        for directory in os.environ.get('PATH', '').split(':'):
+            if directory:
+                path = os.path.join(directory, name)
+                if cls.is_executable_file(path):
+                    return path
+        return None
+
+    @classmethod
+    def exe_effective(cls, name):
+        '''
+        Given name (filename), return what a caller should use
+        when executing a subprocess. When ONBOX, this first looks
+        in the venv bin directory. In all cases, searches $PATH.
+        Returns None for not found.
+        '''
+        if laaso.onbox.ONBOX:
+            # Do not use self.venv / $VIRTUAL_ENV here - that's not set in the
+            # case where we are executing a script and getting the virtualenv
+            # via the shebang.
+            path = os.path.join(laaso.base_defaults.LAASO_VENV_PATH, 'bin', name)
+            if cls.is_executable_file(path):
+                return path
+        if cls.exe_search(name):
+            # It's in $PATH, so we don't need to return an absolute path.
+            return name
+        return None
+
+    @property
+    def ansible_playbook_exe(self):
+        '''
+        Getter: path for ansible-playbook
+        '''
+        return self.exe_effective('ansible-playbook')
+
+    ######################################################################
     # helpers
 
-    def subscription_config_list_from_default_data(self, key, exc_value=EXC_VALUE_DEFAULT) -> list:
+    def subscription_config_dict_from_default_data(self, key, exc_value=EXC_VALUE_DEFAULT) -> dict:
         '''
-        Wrapper for subscription_config_list_from_data that uses
+        Wrapper for subscription_config_dict_from_data that uses
         the default file and data.
         '''
         with self._repo_root_lock:
-            return self.subscription_config_list_from_data(self.subscription_config_filename,
+            return self.subscription_config_dict_from_data(self.subscription_config_filename,
                                                            self.subscription_config_data,
                                                            key,
                                                            exc_value=exc_value)
-
     @staticmethod
     def subscription_config_dict_from_data(filename, data, key, exc_value=EXC_VALUE_DEFAULT) -> dict:
         '''
@@ -344,6 +434,17 @@ class Paths():
         if not isinstance(ret, dict):
             raise exc_value(f"{key} in {filename} has type {type(ret)}; expected dict")
         return ret
+
+    def subscription_config_list_from_default_data(self, key, exc_value=EXC_VALUE_DEFAULT) -> list:
+        '''
+        Wrapper for subscription_config_list_from_data that uses
+        the default file and data.
+        '''
+        with self._repo_root_lock:
+            return self.subscription_config_list_from_data(self.subscription_config_filename,
+                                                           self.subscription_config_data,
+                                                           key,
+                                                           exc_value=exc_value)
 
     @staticmethod
     def subscription_config_list_from_data(filename, data, key, exc_value=EXC_VALUE_DEFAULT) -> list:
@@ -364,12 +465,11 @@ class Paths():
     @property
     def managed_subscription_ids(self):
         '''
-        Generate and return a set of managed subscription_ids.
+        Generate and return a tuple of managed subscription_ids.
         '''
         subscriptions = self.subscription_config_list_from_default_data('subscriptions')
-        ret = {x.get('subscription_id', '') for x in subscriptions}
-        ret.discard('')
-        return frozenset(ret)
+        # explicitly generate a list and return a tuple to avoid returning a generator
+        return tuple([x.get('subscription_id', '') for x in subscriptions if x])
 
     def subscription_config_data_for_one_subscription(self, subscription_id, exc_value=EXC_VALUE_DEFAULT) -> dict:
         '''
@@ -387,9 +487,3 @@ class Paths():
         return dict()
 
 paths = Paths()
-
-if __name__ == "__main__":
-    print("subscription_config_data:\n%s" % laaso.util.indent_pformat(paths.subscription_config_data))
-    print("repo_root=%r" % paths.repo_root)
-    print("subscription_config_filename=%r" % paths.subscription_config_filename)
-    raise SystemExit(0)

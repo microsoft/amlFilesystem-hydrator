@@ -161,3 +161,11 @@ class DevUserUnknownException(ApplicationException):
     def __init__(self, txt, name):
         super().__init__(txt)
         self.name = name
+
+class SubscriptionConfigNotFoundError(ApplicationExit):
+    '''
+    Special case of ApplicationExit used to indicate that
+    the exit reason is that the subscription config file
+    is not found.
+    '''
+    # no specialization here

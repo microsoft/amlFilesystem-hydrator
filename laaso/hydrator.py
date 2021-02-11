@@ -17,11 +17,11 @@ import queue
 import stat
 import sys
 import syslog
+import logging
+from logging.handlers import SysLogHandler
 import threading
 import time
 import traceback
-
-from azure.core.exceptions import ResourceNotFoundError
 
 import laaso.appmanager
 import laaso.azure_tool
@@ -260,6 +260,12 @@ class Hydrator(laaso.appmanager.ApplicationWithManager):
         self.old_umask = None
         self.myuid = os.getuid()
         self.mygid = os.getgid()
+
+        # setup sylog handler -- /dev/log sends logs to local syslogd
+        self.syslog_handler = SysLogHandler(facility=SysLogHandler.LOG_DAEMON, address='/dev/log')
+        self.logger.addHandler(self.syslog_handler)
+        log_format = '[%(levelname)s] %(filename)s \"%(message)s\"'
+        self.syslog_handler.setFormatter(logging.Formatter(fmt=log_format))
 
     @classmethod
     def main_add_parser_args(cls, ap_parser):
@@ -704,6 +710,8 @@ class Hydrator(laaso.appmanager.ApplicationWithManager):
         '''
         Return the mode, uid, gid that should be imported for the file based on the blob attributes.
         '''
+        if not blob_attrs:
+            return BlobAttributes.DEFAULT_MODE_FILES, BlobAttributes.DEFAULT_UID, BlobAttributes.DEFAULT_GID
         mode = blob_attrs.st_mode if blob_attrs.st_mode_valid else BlobAttributes.DEFAULT_MODE_FILES
         uid = blob_attrs.st_uid if blob_attrs.st_uid_valid else BlobAttributes.DEFAULT_UID
         gid = blob_attrs.st_gid if blob_attrs.st_gid_valid else BlobAttributes.DEFAULT_GID
@@ -775,8 +783,8 @@ class Hydrator(laaso.appmanager.ApplicationWithManager):
             self.print_error(work.lustre_path, "Lustre hsm_import error mode=%s, uid=%d, gid=%d, size=%d rc=%d",
                              oct(res.mode), res.uid, res.gid, work.blob_attrs.st_size, res.rc)
         elif res.err_msg:
-            self.print_error(work.lustre_path, "Exception '%s' occurred while importing file:\n%s",
-                             res.err_msg, res.err_tb)
+            self.print_error(work.lustre_path, "Exception %r occurred while importing file %r:\n%s",
+                             res.err_msg, work.lustre_path, res.err_tb)
         else:
             self.stats.progress['last_file'].set(work.lustre_path)
             self.stats.general['size'].add(work.blob_attrs.st_size)
@@ -825,6 +833,15 @@ class Hydrator(laaso.appmanager.ApplicationWithManager):
                                    self.credential_val,
                                    self.manager,
                                    prefix=self.prefix)
+        blobop = self.blobcache.blobop_container_bundle_generate()
+        try:
+            hns_enabled = blobop.hns_enabled
+        except Exception as exc:
+            self.logger.error("%s: cannot access %r: %r", self.mth(), blobop.name, exc)
+            # Drop blobcache ref to avoid getting stuck in blobcache.join()
+            self.blobcache = None
+            raise
+        self.logger.info("%s client_id=%s hns_enabled=%s", self.mth(), self.managed_identity_client_id_post, hns_enabled)
 
     def manager_kwargs(self, **kwargs):
         '''
@@ -861,10 +878,8 @@ class Hydrator(laaso.appmanager.ApplicationWithManager):
                 client_id = self.managed_identity_client_id_post
                 self.credential_val = self.manager.keyvault_secret_get(keyvault_name=self.keyvault_name, secret_name=self.credential, client_id=client_id).value
                 self.logger.debug("Acquired Managed Identity for client_id %r", self.managed_identity_client_id_post)
-            except ResourceNotFoundError as exc:
-                raise ApplicationExit("Could not fetch secret '%s' from keyvault %s" % (self.credential, self.keyvault_name)) from exc
             except Exception as exc:
-                raise ApplicationExit("Could not fetch secret '%s' from keyvault %s" % (self.credential, self.keyvault_name)) from exc
+                raise ApplicationExit("Could not fetch secret %r from keyvault %s: %r" % (self.credential, self.keyvault_name, exc)) from exc
         else:
             self.credential_val = self.credential
 
@@ -968,6 +983,8 @@ class Hydrator(laaso.appmanager.ApplicationWithManager):
             self.init_stats()
             self.clear_umask()
 
+            self.init_blobcache()
+
             self.stats_printer = PeriodicStatsPrinter(self.stats, self.logger, self.STATS_FREQ_SEC, self.resume_file_name,
                                                       self.storage_acct, self.container, self.prefix, self.geneva_enable)
             self.stats_printer.start()
@@ -987,7 +1004,6 @@ class Hydrator(laaso.appmanager.ApplicationWithManager):
 
             self.import_workers = multiprocessing.Pool(self.IMPORT_WORKERS)
 
-            self.init_blobcache()
             self.blobcache.start()
 
             self.go_internal()  # Start main routine
@@ -1092,6 +1108,4 @@ class Hydrator(laaso.appmanager.ApplicationWithManager):
                                       (self.MAX_ERRORS, self.err_file_name))
         self.flush_workers_batch() # flush any outstanding work
 
-if __name__ == "__main__":
-    Hydrator.main(sys.argv[1:])
-    raise SystemExit(1)
+Hydrator.main(__name__)

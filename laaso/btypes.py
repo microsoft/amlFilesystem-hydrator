@@ -5,9 +5,11 @@
 # Licensed under the MIT License.
 #
 '''
-Basic types. No dependencies within the repo but outside this file.
+Basic types. No dependencies within the repo but outside this file other than laaso.base_defaults.
 '''
 import enum
+
+from laaso.base_defaults import EXC_VALUE_DEFAULT
 
 class EnumMixin():
     '''
@@ -66,6 +68,19 @@ class EnumMixin():
     def __gt__(self, other):
         a, b = self._indices(other)
         return a > b
+
+    @classmethod
+    def coerce(cls, value, exc_value=EXC_VALUE_DEFAULT, prefix=''):
+        '''
+        Return value coerced to this type.
+        Raises exc_value with a human-friendly error on failure.
+        '''
+        try:
+            return cls(value)
+        except ValueError as exc:
+            if prefix:
+                raise exc_value(f"{prefix}: {exc}") from exc
+            raise exc_value(str(exc)) from exc
 
 class ReadOnlyDict(dict):
     '''

@@ -131,13 +131,15 @@ class BlobAttributes():
     DEFAULT_MODE_FILES = 0o644
     DEFAULT_MODE_DIRS = 0o777
 
-    BLOB_ISDIR_KEY = 'hdi_isfolder'
+    # Support all lower-case blob metadata keys and first letter upper case.
+    # The latter is required by the wastore copytool.
+    BLOB_ISDIR_KEYS = ['hdi_isfolder', 'Hdi_isfolder']
     BLOB_ISDIR_VAL = 'true'
-    BLOB_FTYPE_KEY = 'ftype'
+    BLOB_FTYPE_KEYS = ['ftype', 'Ftype']
     BLOB_LNK_VAL = 'LNK'
-    BLOB_UID_KEY = 'owner'
-    BLOB_GID_KEY = 'group'
-    BLOB_MODE_KEY = 'permissions'
+    BLOB_UID_KEYS = ['owner', 'Owner']
+    BLOB_GID_KEYS = ['group', 'Group']
+    BLOB_MODE_KEYS = ['permissions', 'Permissions']
 
     # The set of mode bits that we care about
     ALL_MODE_BITS = stat.S_IRWXU | stat.S_IRWXG | stat.S_IRWXO | stat.S_ISVTX
@@ -150,6 +152,12 @@ class BlobAttributes():
     XATTR_URL = XAttr(key_str='trusted.lhsm_url')
     XATTR_HASH = HashXAttr(key_str='trusted.lhsm_hash')
     BASE_LEMUR_ATTRS = [XATTR_URL.to_setxattr_params(), XATTR_HASH.to_setxattr_params()]
+
+    # Flip this switch to True to prefer the HNS PathProperties over the Blob metadata
+    # when populating from an HNS-enabled storage account.
+    # HNS owner/group cannot generally be translated to an integer uid/gid, so this tool
+    # relies on the blob metadata instead.
+    USE_HNS_ATTRIBUTES = False
 
     def __init__(self, blob=None, contents=None):
         '''
@@ -193,9 +201,21 @@ class BlobAttributes():
         '''
         if isinstance(blob, BlobProperties):
             if blob.metadata:
-                return blob.metadata.get(BlobAttributes.BLOB_FTYPE_KEY, '').upper() == BlobAttributes.BLOB_LNK_VAL
+                return BlobAttributes.get_metadata_val(BlobAttributes.BLOB_FTYPE_KEYS, blob).upper() == BlobAttributes.BLOB_LNK_VAL
         # PathProperties (HNS) blobs do not support symlinks
         return False
+
+    @staticmethod
+    def get_metadata_val(keys, blob):
+        '''
+        Return the metadata val associated with one of they keys in the list
+        if the any of the keys exist.  Return the empty string if none of the keys exist.
+        '''
+        if blob.metadata:
+            for key in keys:
+                if key in blob.metadata:
+                    return blob.metadata[key]
+        return ''
 
     def stat(self, blob):
         '''
@@ -204,27 +224,27 @@ class BlobAttributes():
         if isinstance(blob, BlobProperties):
             ftype = Ftypes.FILE
             if blob.metadata:
-                isdir_val = blob.metadata.get(BlobAttributes.BLOB_ISDIR_KEY, '').lower()
+                isdir_val = self.get_metadata_val(BlobAttributes.BLOB_ISDIR_KEYS, blob).lower()
                 if isdir_val:
                     if isdir_val == BlobAttributes.BLOB_ISDIR_VAL:
                         ftype = Ftypes.DIR
                     else:
-                        self.warnings.append("invalid value for attribute %s: '%s'" % (BlobAttributes.BLOB_ISDIR_KEY, isdir_val))
-                ftype_val = blob.metadata.get(BlobAttributes.BLOB_FTYPE_KEY, '').upper()
+                        self.warnings.append("invalid value for key %r: %r" % (BlobAttributes.BLOB_ISDIR_KEYS[0], isdir_val))
+                ftype_val = self.get_metadata_val(BlobAttributes.BLOB_FTYPE_KEYS, blob).upper()
                 if ftype_val:
                     if isdir_val:
                         self.warnings.append("invalid blob attribute combination, cannot have both '%s' and '%s'" %
-                                             (BlobAttributes.BLOB_ISDIR_KEY, BlobAttributes.BLOB_FTYPE_KEY))
+                                             (BlobAttributes.BLOB_ISDIR_KEYS[0], BlobAttributes.BLOB_FTYPE_KEYS[0]))
                     else:
                         if ftype_val == BlobAttributes.BLOB_LNK_VAL:
                             ftype = Ftypes.SYMLINK
                         else:
-                            self.warnings.append("invalid value for attribute %s: '%s'" % (BlobAttributes.BLOB_FTYPE_KEY, ftype_val))
+                            self.warnings.append("invalid value for attribute %s: '%s'" % (BlobAttributes.BLOB_FTYPE_KEYS, ftype_val))
             self.blob2attrs(blob.name,
                             ftype,
-                            blob.metadata.get(BlobAttributes.BLOB_UID_KEY, '') if blob.metadata else '',
-                            blob.metadata.get(BlobAttributes.BLOB_GID_KEY, '') if blob.metadata else '',
-                            blob.metadata.get(BlobAttributes.BLOB_MODE_KEY, '') if blob.metadata else '',
+                            self.get_metadata_val(BlobAttributes.BLOB_UID_KEYS, blob),
+                            self.get_metadata_val(BlobAttributes.BLOB_GID_KEYS, blob),
+                            self.get_metadata_val(BlobAttributes.BLOB_MODE_KEYS, blob),
                             blob.last_modified, blob.size)
         else:
             assert isinstance(blob, PathProperties)
@@ -450,14 +470,21 @@ class BlobCache(multiprocessing.Process):
 
         self.blobs = None
 
+    def blobop_container_bundle_generate(self):
+        '''
+        Get a BlobOpBundle for the container
+        '''
+        cn = ContainerName(self.storage_acct, self.container, subscription_id=self.subscription_id)
+        blobop = self.manager.blobop_bundle_get(cn, credential=self.credential)
+        return blobop
+
     def start_generator(self):
         '''
         Get a generator for listing blobs.
         '''
-        cn = ContainerName(self.storage_acct, self.container, subscription_id=self.subscription_id)
-        blobop = self.manager.blobop_bundle_get(cn, credential=self.credential)
+        blobop = self.blobop_container_bundle_generate()
         name_starts_with = self.prefix if self.prefix else None
-        if blobop.hns_enabled:
+        if blobop.hns_enabled and BlobAttributes.USE_HNS_ATTRIBUTES:
             self.blobs = blobop.filesystemclient.get_paths(path=name_starts_with, recursive=True)
         else:
             self.blobs = blobop.blob_names_iter_get(name_starts_with=name_starts_with, include='metadata')

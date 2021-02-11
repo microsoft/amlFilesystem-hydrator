@@ -57,6 +57,8 @@ class Command():
         '''
         if not isinstance(name, str):
             return False
+        if not name:
+            return False
         if name.startswith('_'):
             return False
         if name in cls.RESERVED_NAMES:
@@ -247,8 +249,6 @@ class _Item():
         qns = self.func.__qualname__.split('.')
         if len(qns) > 1:
             kls = [g[qns[0]]] # use a list for debugging
-            if not kls:
-                return None
             if not isinstance(kls[0], (type,)):
                 raise RuntimeError("attempt to perform decorated handle on item not in the global namespace")
             for qn in qns[1:-1]:
@@ -270,6 +270,6 @@ class _Item():
                                      qns,
                                      qn,
                                      kls, '\n'.join(['   '+x for x in pprint.pformat(inspect.getmembers(kls[-1])).splitlines()]))
-                        raise RuntimeError("attempt to perform decorated handle on item not in the global namespace") from exc
+                    raise RuntimeError("attempt to perform decorated handle on item not in the global namespace") from exc
             return kls[-1]
         return None

@@ -8,6 +8,7 @@
 Objects and operations related to subscription defaults.
 Does not include operations that manipulate subscriptions.
 '''
+import copy
 import re
 import threading
 import uuid
@@ -45,6 +46,19 @@ class SubscriptionInfoDict(ReadOnlyDict):
         Getter for default location for this subscription
         '''
         return self['location_default']
+
+    def name_substitutions_get(self, location=''):
+        '''
+        Return a dict of name_substitutions useful for Jinja templating.
+        '''
+        name_subs = self.get('_name_substitutions', dict())
+        # Do it this way so _name_substitutions can be read-only
+        ret = laaso.util.deep_update(dict(), name_subs)
+        if location:
+            location_defaults = self['location_defaults']
+            location_data = location_defaults.get(location, dict())
+            ret = laaso.util.deep_update(ret, location_data.get('name_substitutions', dict()))
+        return ret
 
 class _SubscriptionMapper():
     '''
@@ -94,6 +108,14 @@ class _SubscriptionMapper():
         # to enable setting defaults for unmanaged subscriptions.
         return laaso._paths.paths.subscription_config_list_from_default_data('subscription_defaults') # pylint: disable=protected-access
 
+    @staticmethod
+    def name_substitutions_bcommon_get() -> dict:
+        '''
+        Return a dict of name substitutions common to all subscriptions.
+        These may be overridden by per-subscription or per-location values.
+        '''
+        return laaso._paths.paths.subscription_config_dict_from_default_data('subscription_name_substitutions') # pylint: disable=protected-access
+
     @property
     def map_dict(self):
         '''
@@ -104,9 +126,9 @@ class _SubscriptionMapper():
                 self._map_dict_data = dict()
                 si_datas = self._all_defaults_get()
                 for idx, si in enumerate(si_datas):
-                    subscription_id = si['subscription_id']
                     if not isinstance(si, dict):
-                        raise ValueError(f"subscriptions[{idx}] has unexpected non-dict type {type(si)}")
+                        raise ValueError(f"subscription_defaults[{idx}] has unexpected non-dict type {type(si)}")
+                    subscription_id = si['subscription_id']
                     aliases = si.get('aliases', list())
                     for alias in aliases:
                         self.subscription_alias_add(subscription_id, alias)
@@ -119,7 +141,12 @@ class _SubscriptionMapper():
         ret = list()
         for idx, si in enumerate(self._all_defaults_get()):
             if 'subscription_id' not in si:
-                raise ValueError(f"subscriptions[{idx}] missing 'subscription_id'")
+                raise ValueError(f"subscription_defaults[{idx}] missing 'subscription_id'")
+            subscription_id = laaso.util.uuid_normalize(si['subscription_id'], key='subscription_id', exc_value=None)
+            if not subscription_id:
+                raise ValueError(f"subscription_defaults[{idx}] invalid 'subscription_id' {si['subscription_id']!r}")
+            si = dict(si)
+            si['subscription_id'] = subscription_id
             if 'location_defaults' in si:
                 location_defaults = dict()
                 for location, ldict in si['location_defaults'].items():
@@ -129,6 +156,13 @@ class _SubscriptionMapper():
                 si['location_defaults'].default_value = location_default_generate()
             else:
                 si['location_defaults'] = location_defaults_generate()
+            name_subs = copy.deepcopy(self.name_substitutions_bcommon_get())
+            ns_key = 'name_substitutions'
+            ns_sub = si.pop(ns_key, dict())
+            if not isinstance(ns_sub, dict):
+                raise ValueError(f"subscription_defaults[{idx}][{ns_key!r}] ({subscription_id}) is not a dict")
+            name_subs = laaso.util.deep_update(name_subs, ns_sub)
+            si['_'+ns_key] = ReadOnlyDict(name_subs)
             ret.append(SubscriptionInfoDict(si))
         return ret
 
@@ -184,6 +218,13 @@ def subscription_info_default_generate(subscription_id):
     ret = {'subscription_id' : subscription_id.lower(),
            'location_defaults' : location_defaults_generate(),
           }
+    if subscription_id == laaso.util.UUID_ZERO:
+        # Special case: UUID_ZERO gets no additional name substitutions.
+        # This is useful for apps such as the shepherd that bootstrap the
+        # subscription config.
+        ret['_name_substitutions'] = dict()
+    else:
+        ret['_name_substitutions'] = subscription_mapper.name_substitutions_bcommon_get()
     return SubscriptionInfoDict(ret)
 
 def subscription_info_get(subscription_id, return_default=True):
@@ -191,12 +232,13 @@ def subscription_info_get(subscription_id, return_default=True):
     Return the subscription descriptor for the given subscription_id.
     If not found, return a default if return_default, otherwise raise KeyError.
     '''
+    if subscription_id == laaso.util.UUID_ZERO:
+        return subscription_info_default_generate(laaso.util.UUID_ZERO)
+    subscription_id_effective = subscription_id
     subscription_id_effective = subscription_mapper.effective(subscription_id)
     for si in subscription_mapper.defaults:
         if si['subscription_id'].lower() == subscription_id_effective:
             return si
     if return_default:
         return subscription_info_default_generate(subscription_id_effective)
-    if subscription_id_effective != subscription_id:
-        raise KeyError("unknown subscription %r (%r)" % (subscription_id, subscription_id_effective))
     raise KeyError("unknown subscription %r" % subscription_id)

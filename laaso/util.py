@@ -28,6 +28,8 @@ import time
 import traceback
 import uuid
 
+import tabulate
+
 from laaso.base_defaults import (EXC_VALUE_DEFAULT,
                                  PF,
                                 )
@@ -382,13 +384,14 @@ class CallResult():
     exc: exception raised by the call.
     At least one of {return,exc} will always be None.
     '''
-    def __init__(self, name, result=None, exc=None):
+    def __init__(self, name, result=None, exc=None, intr=None):
         self.name = name
         self.result = result
         self.exc = exc
+        self.intr = intr
 
     def __repr__(self):
-        return "%s(%r, result=%r, exc=%r)" % (type(self).__name__, self.name, self.result, self.exc)
+        return "%s(%r, result=%r, exc=%r, intr=%r)" % (type(self).__name__, self.name, self.result, self.exc, self.intr)
 
     def __hash__(self):
         return hash(self.name)
@@ -474,6 +477,7 @@ class ThreadWithCallResult(threading.Thread):
                 logger.error("ERROR: %r", exc)
             with cond:
                 callresult.exc = exc
+                callresult.intr = isinstance(exc, KeyboardInterrupt)
             if not isinstance(exc, (Exception, SystemExit)):
                 raise
         finally:
@@ -504,7 +508,7 @@ class Parallel():
         self._max_outstanding = max_outstanding
         assert (self._max_outstanding is None) or (isinstance(self._max_outstanding, int) and (self._max_outstanding > 0))
         self._cur_outstanding = 0
-        self.kbd_intr = False
+        self._kbd_intr = False
 
     def wait(self, timeout=None):
         '''
@@ -527,6 +531,8 @@ class Parallel():
                 return self._done_NL()
             while not self._done_NL():
                 self._cond.wait()
+                if self.intr:
+                    raise KeyboardInterrupt("a thread was interrupted")
             return True
 
     def _can_launch_more_NL(self):
@@ -562,7 +568,7 @@ class Parallel():
             del thread
             self._results.append(callresult)
             if isinstance(callresult.exc, KeyboardInterrupt):
-                self.kbd_intr = True
+                self._kbd_intr = True
             # We are eligible to launch more.
             self._launch_NL()
             # Some waiters like to get a poke even if we are not
@@ -588,6 +594,13 @@ class Parallel():
         '''
         with self._cond:
             self._launch_NL()
+
+    @property
+    def intr(self):
+        '''
+        Return whether any thread got an interrupt
+        '''
+        return self._kbd_intr or any(x.intr for x in self._results)
 
     def failed(self):
         '''
@@ -1385,3 +1398,107 @@ def has_explicit_kwarg(kls, arg):
         if not ca.varkw:
             return False
     return False
+
+def pop_multi(d, keys, required=False):
+    '''
+    Return a copy of d with the keys removed.
+    If required is set, validates that they are present.
+    '''
+    ret = dict(d)
+    if required:
+        for k in keys:
+            ret.pop(k)
+    else:
+        for k in keys:
+            ret.pop(k, None)
+    return ret
+
+def write_and_flush_file(path, data):
+    '''
+    Write the file named by path.
+    Flushes and commits the data.
+    '''
+    unlink(path)
+    mode = 'w' if isinstance(data, str) else 'wb'
+    with open(path, mode) as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+
+def flatten(thing, expand=None):
+    '''
+    Given iterable thing, expand it to a flat list.
+    '''
+    expand = expand if expand is not None else (list, set, tuple)
+    if not isinstance(thing, expand):
+        return thing
+
+    def _flatten(things):
+        '''
+        Helper generator
+        '''
+        for thing in things:
+            if isinstance(thing, expand):
+                for x in _flatten(thing):
+                    yield x
+            else:
+                yield thing
+    return list(_flatten(thing))
+
+def getattr_nested(obj, attr, *args):
+    '''
+    Like getattr(obj, attr, *args), except that attr can be like 'a.b.c'
+    '''
+    if len(args) > 1:
+        raise TypeError("expected at most one argument")
+    if not (isinstance(attr, str) and attr):
+        raise ValueError("attr")
+    cur = obj
+    done = list()
+    for a in attr.split('.'):
+        done.append(a)
+        try:
+            cur = getattr(cur, a)
+        except AttributeError as exc:
+            if args:
+                return args[0]
+            raise AttributeError('.'.join(done)) from exc
+    return cur
+
+def enum_str_normalize_nocase(enumtype, value, member_value_only=False):
+    '''
+    enumtype is an enum or enum-like class.
+    value is a str.
+    Return the first member in enumtype with a case-insensitive match to value.
+    Return value if no match.
+    '''
+    vmatch = value.lower()
+    members = inspect.getmembers(enumtype)
+    for member_key, member_val in members:
+        if not member_key.startswith('_'):
+            if isinstance(member_val, str) and (member_val.lower() == vmatch):
+                return member_val
+            if isinstance(member_val, enum.Enum) and isinstance(member_val.value, str) and (member_val.value.lower() == vmatch):
+                if member_value_only:
+                    return member_val.value
+                return member_val
+    return value
+
+def sort_dict_by_value(a_dict, descending=False):
+    '''
+    Given a_dict, return a new dict where the keys are inserted in sorted
+    order by the original dict's values.  This allows you to iterate over the keys
+    in ascending or descending order of the dict's values.
+    This depends on python3.7's ability to maintain insert order of its keys.
+    '''
+    ret = dict()
+    keys_sorted = sorted(a_dict, key=a_dict.get, reverse=descending)
+    for k in keys_sorted:
+        ret[k] = a_dict[k]
+    return ret
+
+def tabulate_lines(*args, **kwargs):
+    '''
+    Wrapper around tabulate.tabulate that returns a list of lines
+    '''
+    return [x.rstrip() for x in tabulate.tabulate(*args, **kwargs).splitlines()]

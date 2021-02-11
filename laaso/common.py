@@ -37,7 +37,9 @@ import laaso
 from laaso.azresourceid import (AzResourceId,
                                 AzSubResourceId,
                                 RE_RESOURCE_GROUP_ABS,
+                                azresourceid_normalize_subscription_only,
                                )
+import laaso.base_defaults
 from laaso.base_defaults import EXC_VALUE_DEFAULT
 from laaso.btypes import (LogTo,
                           ReadOnlyDict,
@@ -110,6 +112,7 @@ class Application():
                  log_fmt=None,
                  logger=None,
                  python_requirements_check=None,
+                 username='',
                  **kwargs):
         '''
         debug: Debug level verbosity. In the common case, just using self.logger.debug()
@@ -137,6 +140,7 @@ class Application():
         if not (hasattr(self, '_log_level') and hasattr(self, '_logger')):
             self._log_level, self._logger = self._logger_create(log_level, logger, stream=self._logger_stream,
                                                                 log_file=self._log_file, log_fmt=log_fmt)
+        self.username = username or username_default()
         self.logblob_consume_parser_args(kwargs)
         self.logblob_init()
 
@@ -375,7 +379,7 @@ class Application():
         return [name for name, param in inspect.signature(cls.__init__).parameters.items() if (param.default == inspect.Parameter.empty) and (param.kind in arg_kinds)][1:]
 
     @staticmethod
-    def dict_reflect_attrs(obj, d, *args, required=False):
+    def dict_reflect_attrs(obj, d, *args, args_explicit=None, required=False):
         '''
         args are strings for attibutes of self.
         Copy those attributes into dict d.
@@ -401,6 +405,8 @@ class Application():
                 attr_name = x
             try:
                 d[kwarg_name] = getattr(obj, attr_name)
+                if args_explicit is not None:
+                    args_explicit.add(kwarg_name)
             except AttributeError:
                 if required:
                     raise
@@ -429,6 +435,10 @@ class Application():
                'logger_stream' : obj.logger_stream,
                'logger' : obj.logger,
               }
+        cls.dict_reflect_attrs(obj, ret,
+                               'username',
+                               args_explicit=ret['args_explicit'],
+                              )
         cls._kwargs_for_self_copy(obj, ret)
         ret.update(kwargs)
         cls._kwargs_for_self_fixup(obj, ret)
@@ -630,7 +640,7 @@ class Application():
             if name not in ap_args.args_explicit:
                 args_dict.pop(name, None)
         debug = ap_args.debug
-        exit_verbose = args_dict.pop('exit_verbose', False)
+        exit_verbose = args_dict.pop('exit_verbose', cls.EXIT_VERBOSE_ALWAYS)
 
         args_dict, args_saved = cls.args_process(args_dict)
         assert isinstance(args_dict, (dict,))
@@ -657,7 +667,16 @@ class Application():
         laaso.output.capture()
 
     @classmethod
-    def main(cls, cmd_args):
+    def main(cls, name):
+        '''
+        Entrypoint as from the command-line.
+        '''
+        if name == '__main__':
+            cls.main_with_args(sys.argv[1:])
+            raise SystemExit(1)
+
+    @classmethod
+    def main_with_args(cls, cmd_args):
         '''
         Entrypoint as from the command-line.
         Define args parsing. cmd_args is typically sys.argv[1:].
@@ -666,7 +685,7 @@ class Application():
         cls._cls_init()
         c = None
         debug = 1
-        exit_verbose = False
+        exit_verbose = cls.EXIT_VERBOSE_ALWAYS or ('--exit_verbose' in cmd_args)
         logger = None
 
         try:
@@ -693,7 +712,8 @@ class Application():
                 if logger is not None:
                     logger.error("%s", exc.code)
                 else:
-                    print(str(exc.code))
+                    log_to_stream = sys.stderr if cls.LOG_TO_DEFAULT == LogTo.STDERR.value else sys.stdout
+                    print(str(exc.code), file=log_to_stream)
             if isinstance(exc, SystemExit):
                 if c is not None:
                     c.logblob_flush_noraise()
@@ -822,7 +842,11 @@ class Application():
                 raise ApplicationExit(1) from exc
         return 0
 
+    EXIT_VERBOSE_ALWAYS = False
     LOG_TO_DEFAULT = LogTo.STDOUT.value
+
+    ARG_USERNAME_ADD = False
+    ARG_USERNAME_HELP = argparse.SUPPRESS
 
     @classmethod
     def main_add_parser_args(cls, ap_parser):
@@ -835,8 +859,9 @@ class Application():
         group.add_argument('--debug', type=int, default=cls.debug_default(),
                            action=ArgExplicit,
                            help='debug level')
-        group.add_argument('--exit_verbose', action="store_true",
-                           help='print/log exit status')
+        if not cls.EXIT_VERBOSE_ALWAYS:
+            group.add_argument('--exit_verbose', action="store_true",
+                               help='print/log exit status')
         group.add_argument('--log_level', type=str, default=cls.LOG_LEVEL_DEFAULT, choices=cls.LOG_LEVEL_CHOICES,
                            action=ArgExplicit,
                            help='log level')
@@ -852,6 +877,10 @@ class Application():
         group.add_argument('--subscription_config_path', type=str, default=None,
                            action=ArgExplicit,
                            help=argparse.SUPPRESS)
+        if cls.ARG_USERNAME_ADD:
+            group.add_argument('--username', type=str, default=username_default(),
+                               action=ArgExplicit,
+                               help=cls.ARG_USERNAME_HELP)
 
     def manager_kwargs(self, **kwargs):
         '''
@@ -860,6 +889,7 @@ class Application():
         ret = {'debug' : self.debug,
                'log_level' : self._log_level,
                'logger' : self._logger,
+               'username' : self.username,
               }
         ret.update(kwargs)
         return ret
@@ -1013,7 +1043,7 @@ class Application():
                     return False
         return True
 
-    _ANSIBLE_CFG_ON_LAASO_VM = '/usr/laaso/lib/ansible/ansible.cfg'
+    _ANSIBLE_CFG_ON_LAASO_VM = '/usr/laaso/ansible/ansible.cfg'
 
     @classmethod
     def ansible_cfg_search(cls):
@@ -1026,6 +1056,8 @@ class Application():
                 return cfg
             # Cannot use user-specified directory. Do not search for others.
             return None
+        if laaso.ONBOX:
+            return cls._ANSIBLE_CFG_ON_LAASO_VM if os.path.isfile(cls._ANSIBLE_CFG_ON_LAASO_VM) else None
         # Common case: relative to the repo root. This happens when we
         # are sitting somewhere inside the repo.
         repo_root = laaso.paths.repo_root
@@ -1126,6 +1158,8 @@ class Application():
         if kwargs.pop('check', True):
             self.ansible_cfg_check()
         ret = {'ANSIBLE_CONFIG' : self.ansible_cfg}
+        if self.username and (self.username != getpass.getuser()):
+            kwargs['ANSIBLE_REMOTE_USER'] = self.username
         ret.update(kwargs)
         return ret
 
@@ -1281,23 +1315,35 @@ class Application():
         cfg_parent = os.path.split(cfg)[0]
         playbook_path = os.path.join(cfg_parent, playbook)
         if not os.path.isfile(playbook_path):
+            try:
+                ap = os.path.abspath(playbook_path)
+                self.logger.error("%s does not exist or is not a file; abspath=%r", playbook_path, ap)
+            except Exception as exc:
+                self.logger.error("%s does not exist or is not a file; cannot determine abspath: %r", playbook_path, exc)
             raise ValueError("%s does not exist or is not a file" % playbook_path)
 
         inventory_str = self.ansible_inventory_xlat(inventory)
 
-        cmd = ['ansible-playbook', '--inventory='+inventory_str]
+        cmd = [laaso.paths.ansible_playbook_exe, '--inventory='+inventory_str]
+        lev = dict()
         if add_scfg:
             subscription_id = getattr(self, 'subscription_id', '')
-            extra_vars = dict(extra_vars) if extra_vars else dict()
             if hasattr(self, 'scfg_dict_generate'):
-                extra_vars['laaso_scfg'] = self.scfg_dict_generate() # pylint: disable=no-member
+                lev['laaso_scfg'] = self.scfg_dict_generate() # pylint: disable=no-member
             else:
-                extra_vars['laaso_scfg'] = laaso.scfg.to_scfg_dict(subscription_default=subscription_id)
+                lev['laaso_scfg'] = laaso.scfg.to_scfg_dict(subscription_default=subscription_id)
             if hasattr(self, 'subscription_defaults_generate'):
-                extra_vars['laaso_subscription_defaults'] = self.subscription_defaults_generate() # pylint: disable=no-member
-            extra_vars['laaso_subscription_config'] = self.subscription_config_generate()
+                laaso_subscription_defaults = self.subscription_defaults_generate() # pylint: disable=no-member
+                laaso_subscription_defaults = self.jinja_filter_data(laaso_subscription_defaults)
+                lev['laaso_subscription_defaults'] = laaso_subscription_defaults
+            subscription_name_substitutions = laaso.paths.subscription_config_dict_from_default_data('subscription_name_substitutions')
+            subscription_name_substitutions = self.name_substitutions_resolve(subscription_name_substitutions)
+            lev['subscription_name_substitutions'] = {'subscription_name_substitutions' : subscription_name_substitutions}
+            lev['laaso_subscription_config'] = self.subscription_config_generate()
         if extra_vars:
-            cmd.append('--extra-vars='+json.dumps(extra_vars, default=str))
+            lev.update(extra_vars)
+        if lev:
+            cmd.append('--extra-vars='+json.dumps(lev, default=str))
         cmd.append(playbook_path)
         if verbosity > 0:
             cmd.extend(['-v'] * verbosity)
@@ -1393,7 +1439,9 @@ class Application():
         assert len(p.results()) == len(filenames)
         filenames_failed = [x.name for x in p.failed()]
         if filenames_failed:
-            if (os.getcwd() == laaso.paths.repo_root) or (laaso.paths.repo_root == '.'):
+            if laaso.ONBOX:
+                exe = '/usr/laaso/bin/ansible_run_lint.py'
+            elif (os.getcwd() == laaso.paths.repo_root) or (laaso.paths.repo_root == '.'):
                 exe = os.path.join('laaso', 'ansible_run_lint.py')
             else:
                 exe = os.path.join(laaso.paths.repo_root, 'laaso', 'ansible_run_lint.py')
@@ -1407,11 +1455,20 @@ class Application():
             raise ApplicationExit(1)
         return todo
 
+    @staticmethod
+    def ansible_lint_exe():
+        '''
+        Return the name of the ansible-lint executable
+        '''
+        if laaso.ONBOX:
+            return os.path.join(laaso.base_defaults.LAASO_VENV_PATH, 'bin', 'ansible-lint')
+        return 'ansible-lint'
+
     def _ansible_run_lint_one(self, filename):
         '''
         Lint one file
         '''
-        cmd = ['ansible-lint'] + [filename]
+        cmd = [self.ansible_lint_exe(), filename]
         ansible_env = self.ansible_env()
         self.logger.debug("run: %s", cmd_str(cmd, ansible_env))
         try:
@@ -1538,7 +1595,7 @@ class Application():
                     ret.append(out_data)
         return {'subscriptions' : ret}
 
-    def subscription_value_get(self, key, *args, subscription_id=None):
+    def subscription_value_get(self, key, *args, subscription_id=None, location=None):
         '''
         Get a per-subscription value identified by key. If that value
         is not found, and an extra argument is provided, that argument
@@ -1556,11 +1613,21 @@ class Application():
                 try:
                     return s[key]
                 except KeyError:
+                    location = location if location is not None else self.location_effective(location)
+                    name_subs = s.name_substitutions_get(location=location)
+                    try:
+                        return name_subs[key]
+                    except KeyError:
+                        pass
                     if args:
                         return args[0]
                     raise
-        if args:
-            return args[0]
+        sns = laaso.subscription_mapper.name_substitutions_bcommon_get()
+        try:
+            return sns[key]
+        except KeyError:
+            if args:
+                return args[0]
         raise KeyError(key)
 
     def location_value_get(self, key, *args, subscription_id=None, location=None):
@@ -1592,13 +1659,16 @@ class Application():
         '''
         Given a location (region) specification, return the name of a location to use.
         When a location is truthy, we just use that. Otherwise, we fall back to
-        the per-subscrition defsult.
+        the per-subscription default.
         args is simply zero or more possible locations tried in order; the first
         non-truthy arg is used.
         '''
         for arg in args:
             if arg:
                 return arg
+        location = getattr(self, 'location', '')
+        if location:
+            return location
         return self.subscription_value_get('location_default', laaso.base_defaults.LOCATION_DEFAULT_FALLBACK)
 
     def network_security_group_id_effective(self, location=None, network_security_group_id=None, resource_group=None, resource_group_fallback=None, subscription_id=None):
@@ -1672,28 +1742,37 @@ class Application():
         tc = time.gmtime(time_cur)
         dt = time.strftime('%Y-%m-%d-%H-%M-%S', tc)
         dt_exact = dt + '-' + str(time_cur - int(time_cur))[2:]
+        location_default = kwargs.get('location_default', self.location_effective())
+        location = kwargs.get('location', getattr(self, 'location', location_default)) or ''
         subs = {'application_class' : type(self).__name__,
                 'azure_certificate_store' : laaso.base_defaults.AZURE_CERTIFICATE_STORE,
                 'datetime' : dt,
                 'datetime_exact' : dt_exact,
                 'scfg' : laaso.scfg,
-                'subscription_ids' : laaso.subscription_ids,
                 'location_value_get' : self.location_value_get,
+                'subscription_ids' : laaso.subscription_ids,
                 'subscription_mapper' : laaso.subscription_mapper,
                 'time_cur' : time_cur,
-                'user' : getpass.getuser(),
+                'user' : self.username,
+                'username' : self.username,
                }
-        location_default = self.location_effective(getattr(self, 'location', ''))
-        if location_default:
-            subs['location_default'] = location_default
-        try:
-            subs['subscription_id'] = self.subscription_id
-        except AttributeError:
-            pass
+        if 'subscription_id' in kwargs:
+            subs['subscription_id'] = kwargs['subscription_id']
+        elif hasattr(self, 'subscription_id'):
+            subs['subscription_id'] = getattr(self, 'subscription_id')
         try:
             subs['subscription_desc'] = self.subscription_info
         except AttributeError:
             pass
+        if location_default or ('location_default' in kwargs):
+            subs['location_default'] = location_default
+        if location or ('location' in kwargs):
+            subs['location'] = location
+        subscription_id = subs.get('subscription_id', '')
+        if subscription_id:
+            si = laaso.subscription_info_get(subscription_id)
+            subs = laaso.util.deep_update(subs, si.name_substitutions_get(location=location))
+
         subs.update(self.jinja_additional_substitutions)
         subs.update(kwargs)
         return subs
@@ -1754,6 +1833,10 @@ class Application():
                 else:
                     self.logger.warning("%s error expanding %r: %r", self.mth(), prev, exc)
                 raise
+            except Exception as exc:
+                self.logger.error("%s: key=%r prev=%r value=%r cannot compute jinja2 effective value: %r",
+                                  self.mth(), key, prev, value, exc)
+                raise
             if newvalue == prev:
                 return newvalue
             prev = newvalue
@@ -1797,6 +1880,29 @@ class Application():
         # No translation
         return data
 
+    def name_substitutions_resolve(self, name_substitutions):
+        '''
+        name_substitutions is a dict that we intend to re-export to
+        the subscription config (yaml) on another node. This is
+        plumbed through ansible playbooks as extra_vars.
+        Resolve everything we can. This applies known special-cases
+        for things like subscription IDs and resource IDs.
+        '''
+        def exval_sub(ret, key):
+            '''
+            If the named key is present in ret as a string,
+            normalize any embedded subscription_id.
+            '''
+            v = ret.get(key, None)
+            if isinstance(v, str) and v:
+                ret[key] = azresourceid_normalize_subscription_only(v)
+
+        ret = self.jinja_filter_data(name_substitutions)
+        exval_sub(ret, 'genevaIdentityDefault')
+        exval_sub(ret, 'genevaKeyVaultSubDefault')
+        exval_sub(ret, 'omsWorkspaceIdDefault')
+        return ret
+
 class ApplicationWithSubscription(Application):
     '''
     Application that operates on a subscription
@@ -1808,10 +1914,12 @@ class ApplicationWithSubscription(Application):
             # default to avoid translating subscription IDs before construction.
             # That avoids fetching and caching the config before construction.
             subscription_id = laaso.subscription_ids.subscription_default
-        use_subscription_id = getattr(self, 'subscription_id', '') or subscription_id or laaso.subscription_ids.subscription_default
+        use_subscription_id = getattr(self, 'subscription_id', '') or subscription_id
+        if self.SUBSCRIPTION_ID_REQUIRED:
+            use_subscription_id = use_subscription_id or laaso.subscription_ids.subscription_default
         self.tenant_id = getattr(self, 'tenant_id', '') or tenant_id or laaso.scfg.tenant_id_default
 
-        self.subscription_id_set(laaso.subscription_mapper.effective(use_subscription_id))
+        self.subscription_id_set(use_subscription_id)
 
     @property
     def subscription_id(self):
@@ -1831,7 +1939,12 @@ class ApplicationWithSubscription(Application):
         '''
         Update self.subscription_id and related values
         '''
-        self._subscription_id = laaso.subscription_mapper.effective(value) or ''
+        # Only use the mapper if we must. Before the shepherd bootstraps,
+        # it cannot safely use the mapper.
+        subscription_id = laaso.util.uuid_normalize(value, key='subscription_id', exc_value=None)
+        if not subscription_id:
+            subscription_id = laaso.subscription_mapper.effective(value)
+        self._subscription_id = subscription_id
         self.subscription_info = self.subscription_info_get()
 
     @property
@@ -1845,6 +1958,9 @@ class ApplicationWithSubscription(Application):
         return self.subscription_id
 
     SUBSCRIPTION_ID_ARG = True
+    SUBSCRIPTION_ID_REQUIRED = True
+
+    TENANT_ID_ARG_ADD = True
 
     @classmethod
     def main_add_parser_args(cls, ap_parser):
@@ -1854,12 +1970,18 @@ class ApplicationWithSubscription(Application):
         super().main_add_parser_args(ap_parser)
         group = ap_parser.get_argument_group('subscription')
         if cls.SUBSCRIPTION_ID_ARG:
-            group.add_argument('--subscription_id', type=str, default='default',
+            if cls.SUBSCRIPTION_ID_REQUIRED:
+                group.add_argument('--subscription_id', type=str, default='default',
+                                   action=ArgExplicit,
+                                   help='subscription ID on which to operate (default %(default)r)')
+            else:
+                group.add_argument('--subscription_id', type=str, default='',
+                                   action=ArgExplicit,
+                                   help='subscription ID on which to operate (default to no subscription)')
+        if cls.TENANT_ID_ARG_ADD:
+            group.add_argument('--tenant_id', type=str, default='',
                                action=ArgExplicit,
-                               help='subscription ID on which to operate (default %(default)r)')
-        group.add_argument('--tenant_id', type=str, default='',
-                           action=ArgExplicit,
-                           help='Azure tenant_id')
+                               help='Azure tenant_id')
 
     @classmethod
     def _kwargs_for_self_copy(cls, obj, d):
@@ -2102,7 +2224,14 @@ class ApplicationWithResourceGroup(ApplicationWithSubscription):
                 raise exc_value("cannot parse %r" % name_or_id)
         return str(rid)
 
-def child_app(parent, appclass, appargs, namestack):
+def username_default():
+    '''
+    Return the username to be used when not otherwise defined.
+    This may be invoked before application objects are constructed.
+    '''
+    return getpass.getuser()
+
+def child_app(parent, appclass, appargs, namestack, posargs=None):
     '''
     Construct an Application-like object of type appclass and return it.
     appargs is a dict of explicit arguments for the new app. This operation
@@ -2113,21 +2242,17 @@ def child_app(parent, appclass, appargs, namestack):
     expect_logger = appargs.get('logger', parent.logger)
     appargs.setdefault('args_explicit', set()).update(appargs.keys())
     app_kwargs = appclass.kwargs_for_class(parent, **appargs)
+    posargs = posargs or tuple()
     # appclass may or may not like namestack as an init arg.
     if laaso.util.has_explicit_kwarg(appclass, 'namestack'):
         app_kwargs.setdefault('namestack', namestack)
     try:
-        app = appclass(**app_kwargs)
+        app = appclass(*posargs, **app_kwargs)
     except ApplicationExitWithNote as exc:
         raise
     except ApplicationExit as exc:
         raise ApplicationExitWithNote(exc.code, note=namestack) from exc
     assert id(app.logger) == id(expect_logger)
-    if isinstance(app, ApplicationWithSubscription):
-        if parent.subscription_id:
-            assert app.subscription_id == parent.subscription_id
-        else:
-            assert app.subscription_id
     return app
 
 class ApplicationWithInheritedAnsibleEnv(ApplicationWithSubscription):
@@ -2157,6 +2282,4 @@ class ApplicationWithInheritedAnsibleEnv(ApplicationWithSubscription):
         '''
         return super().ansible_env(application_obj, **kwargs)
 
-if __name__ == "__main__":
-    Application.main(sys.argv[1:])
-    raise SystemExit(1)
+Application.main(__name__)

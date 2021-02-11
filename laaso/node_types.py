@@ -41,6 +41,13 @@ class AnsibleNodeType(EnumMixin, enum.Enum):
     AGTSTD = 'agtstd'
     LCLIENT = 'client'
 
+    @classmethod
+    def all_keys(cls):
+        '''
+        return set of nodetype enum
+        '''
+        return set(cls.values())
+
 _ANTYPE_NTYPE = {
     AnsibleNodeType.MGS.value: NodeType.MDS.value,
     AnsibleNodeType.MDS.value: NodeType.MDS.value,

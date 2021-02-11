@@ -11,7 +11,6 @@ necessary fields.
 '''
 
 import ctypes
-import sys
 import time
 
 import laaso.common
@@ -147,6 +146,4 @@ class HSMImportFile(laaso.common.Application):
                          self.abspath, fid_out.f_seq, fid_out.f_oid, fid_out.f_ver, rc)
         raise ApplicationExit(0)
 
-if __name__ == "__main__":
-    HSMImportFile.main(sys.argv[1:])
-    raise ApplicationExit(1)
+HSMImportFile.main(__name__)

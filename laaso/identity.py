@@ -11,13 +11,15 @@ import uuid
 
 import laaso
 from laaso.azresourceid import AzResourceId
+import laaso.dev_users
 import laaso.util
 
 def uami_azrid_from_str(val, az_mgr):
     '''
     Given val as a string, convert it to the ARM resource ID of a user-assigned managed identity.
     Return None if it cannot be converted.
-    az_mgr is laaso.azure_tool.Manager.
+    az_mgr is laaso.azure_tool.Manager or None. If it is None,
+    this operation cannot perform tranlations inferred from the az_mgr, such as the 'resource_group/name' form.
     '''
     class LocalValueError(ValueError):
         '''
@@ -86,7 +88,7 @@ def uami_azrid_from_str(val, az_mgr):
                                     exc_value=LocalValueError)
         return None
 
-    if len(toks) == 2:
+    if az_mgr and (len(toks) == 2):
         # Assume that this is resource_group/name in the az_mgr subscription
         try:
             return AzResourceId(az_mgr.subscription_id,
@@ -134,6 +136,8 @@ def client_id_from_verify_client_id_in_config(val):
     Return it.
     Return empty str for not found.
     '''
+    if not isinstance(val, str):
+        raise ValueError(f"invalid UAMI name {val!r}")
     res = laaso.util.uuid_normalize(val, exc_value=None)
     if res:
         return res
@@ -191,6 +195,16 @@ def principal_id_from_dev_service_principal_display_name(val):
         return dsp.object_id
     return ''
 
+def principal_id_from_dev_user(val, az_mgr):
+    '''
+    Given a username, return the corresponding AAD principal_id or None
+    '''
+    du = laaso.dev_users.DevUser.dev_user_get(val, raise_on_notfound=False)
+    if not (du and du.ad_user):
+        return None
+    ad = az_mgr.ad_user_get(du.ad_user)
+    return ad.object_id if ad else None
+
 def principal_id_from_str(val, az_mgr):
     '''
     val is an arbitrary string.
@@ -220,3 +234,25 @@ def principal_id_from_str(val, az_mgr):
         if ret:
             return ret
     return ''
+
+def logical_name_for_object_id(object_id, az_mgr, adobj=None):
+    '''
+    Given an object_id (UUID as str), return a logical name to show to a human.
+    This mapping might not be reversible.
+    '''
+    # normalize the object_id to check for validity
+    object_id_normalized = laaso.util.uuid_normalize(object_id, key='object_id')
+    if not adobj:
+        adobj = az_mgr.ad_get_object_by_object_id(object_id_normalized)
+    if adobj:
+        try:
+            if adobj.user_principal_name:
+                return adobj.user_principal_name
+        except AttributeError:
+            pass
+        try:
+            if adobj.display_name:
+                return adobj.display_name
+        except AttributeError:
+            pass
+    return f"unrecognized object_id {object_id!r}"

@@ -6,8 +6,12 @@ hydrator.py is a Python-based program for importing a Lustre
 namespace from an Azure storage account.  Imported files are
 left in the 'released'/'exist' Lustre HSM state once imported into
 Lustre so they can later be hydrated on-demand by a compatible
-copytool.  A copytool is required to hydrate the file contents
-from the Azure storage account.
+copytool.
+
+A copytool is required to hydrate the contents of
+from the Azure storage account.  amlFilesystem-hydrator and its
+attribute definition is compatible with the
+[wastore/lemur](https://github.com/wastore/lemur/) copytool.
 
 ## Supported platforms
 
@@ -80,32 +84,24 @@ prefix "some/prefix":
 (hydrator_venv)# PYTHONPATH=. laaso/hydrator.py "mystorageacct" "mycontainer" "mysas" -a /mnt/lustre -p "some/prefix" --lemur
 ```
 
-Note: the --lemur flag is typically required for compatibility with copytools
-that are based off of the Lustre [lemur project](https://github.com/edwardsp/lemur).
+Note: the --lemur flag is required for compatibility with copytools
+that are based off of the Lustre [lemur project](https://github.com/edwardsp/lemur),
+including [wastore/lemur](https://github.com/wastore/lemur/).
 
 ## Metadata attributes
 
 hydrator.py is capable of setting ownership and permission bits on Lustre
-files when they are specified in blob metadata, or when used with the
-Hierarchical Namespace (HNS) feature.
+files when they are specified in blob metadata.
 
-For storage accounts that have the Hierarchical Namespace feature enabled (HNS),
-the ownership and permission bits are read right out of each object's metadata as
-specified in [Data Lake Storage Gen2 | Path - Update](https://docs.microsoft.com/en-us/rest/api/storageservices/datalakestoragegen2/path/update).  Here is an abbreviated reference to the key attributes:
-* ``x-ms-owner``: uid
-* ``x-ms-group``: gid
-* ``x-ms-permissions``: permissions
-
-For non-HNS accounts, you may manually or programatically set these fields in
-the metadata for individual blobs and hydrator.py will apply them to the
-corresponding files in the Lustre namespace.  If applying them manually via the portal,
-use the fields as specified above, minus the 'x-ms-' prefix:
+Set the following metadata fields on a blob using the Azure portal to give the
+file corresponding POSIX attributes when the file is imported into the Lustre
+name space:
 * ``owner``: uid
 * ``group``: gid
 * ``permissions``: permissions
 
-If applying blob metadata attributes using REST or SDK calls, apply blob
-metadata attributes prepended with 'x-ms-meta-': 
+If applying blob metadata attributes using REST or SDK calls, you may need
+to apply blob metadata attributes prepended with 'x-ms-meta-': 
 * ``x-ms-meta-owner``: uid
 * ``x-ms-meta-group``: gid
 * ``x-ms-meta-permissions``: permissions

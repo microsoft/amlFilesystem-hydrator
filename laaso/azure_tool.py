@@ -11,9 +11,10 @@ Scripted management for laaso server VMs for testing
 import base64
 import configparser
 import copy
-import getpass
+import enum
 import http.client
 import inspect
+import io
 import json
 import logging
 import os
@@ -25,22 +26,27 @@ import threading
 import time
 import traceback
 import urllib.parse
+import uuid
 import yaml
 
+from defusedxml import ElementTree
 from tabulate import tabulate
 
 import OpenSSL.crypto
 import azure.common.client_factory
 import azure.common.credentials
+import azure.core.exceptions
 import azure.core.pipeline
 from azure.graphrbac import GraphRbacManagementClient
 import azure.identity
+import azure.identity._credentials
 import azure.keyvault.certificates
 import azure.keyvault.keys
 import azure.keyvault.secrets
 import azure.kusto.data
 from azure.mgmt.authorization import AuthorizationManagementClient
 import azure.mgmt.authorization.models
+import azure.mgmt.authorization.v2018_01_01_preview.models
 from azure.mgmt.compute import ComputeManagementClient
 from azure.mgmt.compute.models import ResourceIdentityType
 from azure.mgmt.keyvault import KeyVaultManagementClient
@@ -48,8 +54,11 @@ from azure.mgmt.loganalytics import LogAnalyticsManagementClient
 from azure.mgmt.msi import ManagedServiceIdentityClient
 from azure.mgmt.network import NetworkManagementClient
 from azure.mgmt.resource import ResourceManagementClient
+import azure.mgmt.resource.resources.models
 from azure.mgmt.resourcegraph import ResourceGraphClient
 from azure.mgmt.storage import StorageManagementClient
+from azure.mgmt.subscription import SubscriptionClient
+import azure.storage.blob
 from azure.storage.blob import (BlobClient,
                                 BlobServiceClient,
                                 BlobType,
@@ -59,6 +68,7 @@ from azure.storage.filedatalake import (DataLakeDirectoryClient,
                                         DataLakeServiceClient,
                                         FileSystemClient,
                                        )
+import azure.mgmt.subscription
 import cryptography.hazmat.primitives.serialization
 import cryptography.hazmat.primitives.serialization.pkcs12
 import knack.util
@@ -71,17 +81,24 @@ import urllib3
 import laaso
 import laaso.azresourceid
 from laaso.azresourceid import (AzAnyResourceId,
+                                AzProviderResourceId,
                                 AzResourceId,
                                 AzSub2ResourceId,
                                 AzSubResourceId,
+                                AzSubscriptionProviderResourceId,
                                 AzSubscriptionResourceId,
                                 RE_GALLERY_NAME_ABS,
                                 RE_RESOURCE_GROUP_ABS,
                                 azresourceid_from_text,
+                                azresourceid_or_none_from_text,
+                                azrid_is,
+                                azrid_normalize,
+                                azrid_normalize_or_none,
                                )
 import laaso.base_defaults
 from laaso.base_defaults import EXC_VALUE_DEFAULT
-from laaso.btypes import (ReadOnlyDict,
+from laaso.btypes import (EnumMixin,
+                          ReadOnlyDict,
                           VM_OS_DISK_STORAGE_ACCOUNT_TYPE_DEFAULT,
                          )
 from laaso.cacher import CacheIndexer
@@ -166,9 +183,22 @@ except ModuleNotFoundError:
 # including the metadata service, might drop support for a version,
 # so these can go stale. Code that talks directly to endpoints
 # without going through the SDKs must be prepared for version changes.
-REST_API_VERSIONS = ReadOnlyDict({'keyvault' : '2019-09-01',
-                                  'metadata_service' : '2020-06-01', # https://docs.microsoft.com/en-us/azure/virtual-machines/windows/instance-metadata-service
+REST_API_VERSIONS = ReadOnlyDict({'metadata_service' : '2020-06-01', # https://docs.microsoft.com/en-us/azure/virtual-machines/windows/instance-metadata-service
                                  })
+
+# Unless otherwise specified, use these REST API versions
+# for these client classes in place of the SDK default.
+API_VERSIONS_DEFAULT = ((AuthorizationManagementClient, '2018-01-01-preview'),
+                       )
+
+class AzCred(EnumMixin, enum.Enum):
+    '''
+    Magic values that may be placed in a client_id list to indicate
+    things that are not UAMI client_ids. In addition to these
+    magic values, None is like login, but it is always appended.
+    '''
+    LOGIN = 'login'
+    SYSTEM_ASSIGNED = 'system-assigned'
 
 class ToolException(ApplicationException):
     '''
@@ -438,6 +468,13 @@ class BlobOpBundle():
         '''
         return self._manager.cloud
 
+    @property
+    def name(self):
+        '''
+        Getter - name object (eg BlobName, ContainerName, ...)
+        '''
+        return self._name
+
     @staticmethod
     def name_normalize(name, subscription_id=None, subscription_id_default=None):
         '''
@@ -682,7 +719,6 @@ class BlobOpBundle():
                                                                           storage_account_key=self._storage_account_key,
                                                                           sas_token=self._sas_token,
                                                                           credential=self._credential)
-            self._blobserviceclient = msapiwrap(self.logger, self._blobserviceclient)
             if (not self._blobserviceclient) and self.warn_missing:
                 self.logger.warning("%s.%s cannot generate BlobServiceClient for %r", type(self).__name__, getframe(0), self._name)
 
@@ -830,7 +866,8 @@ class BlobOpBundle():
 
     def container_properties_get(self):
         '''
-        Retrieve properties of the target container
+        Retrieve properties of the target container.
+        Returns azure.storage.blob.ContainerProperties.
         '''
         cc = self.containerclient
         if not cc:
@@ -1110,7 +1147,6 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
                  source_vm_name='',
                  storage_account='',
                  subnet_name='',
-                 username='',
                  vm_boot_diags_storage_account='',
                  vm_image_name=None,
                  vm_image_resource_group='',
@@ -1146,7 +1182,6 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
         self.secret_name = secret_name
         self.storage_account_name = storage_account or ''
         self.subnet_name = subnet_name or self.location_value_get('subnet', '')
-        self.username = username or getpass.getuser()
         self.vm_boot_diags_storage_account = vm_boot_diags_storage_account or self.location_value_get('vm_boot_diags_storage_account_default', '') or ''
         self.vm_image_name = vm_image_name
         self.vm_image_resource_group = vm_image_resource_group or laaso.scfg.get('vm_image_resource_group_default', '')
@@ -1177,14 +1212,6 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
 
         self._az_client_gen_lock = threading.RLock()
 
-        # keys in _keyvault_clients are the content type (certificate/key/secret)
-        # values are dicts of vault_name -> client
-        # vault names are universally global. No subscription_id needed.
-        self._keyvault_clients = {'certificate' : dict(), # azure.keyvault.certificates.CertificateClient
-                                  'key' : dict(), # azure.keyvault.keys.KeyClient
-                                  'secret' : dict(), # azure.keyvault.secrets.SecretClient
-                                 }
-
         self._az_kusto = dict() # key=URI value=KustoClient
 
         # ManagementClient wrappers
@@ -1196,11 +1223,17 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
         self._az_network = None
         self._az_resource = None
         self._az_storage = None
+        self._az_subscription = None
 
         self._managed_identity_lock = threading.RLock()
         self._managed_identity_azrid = None
         self._managed_identity_name = managed_identity or laaso.scfg.get('msi_client_id_default', '')
-        self._managed_identity_client_id = managed_identity_client_id
+        if managed_identity_client_id:
+            # Only update this if the caller provided something.
+            self._pin_client_id = managed_identity_client_id
+
+        # The client_id associated with self._managed_identity_name
+        self._managed_identity_client_id_for_name = None
 
         # load VM user-assigned identities
         self.clientids_dict = dict()
@@ -1247,6 +1280,20 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
     # one that works.
     UAMI_CLIENTIDS_FILE_PATH = "/usr/laaso/etc/uami_clientids.yaml"
 
+    _pin_client_id = ''
+
+    @classmethod
+    def pin_managed_identity_client_id(cls, client_id):
+        '''
+        This defaults objects to pinning client_id as the only
+        auth for operations. This may be overridden by constructing
+        the object with an explicit, alternate client_id, or by
+        providing an alternate client_id to calls that accept
+        client_id arguments. This is typically used by onbox things
+        like the shepherd that have no user auth available.
+        '''
+        cls._pin_client_id = client_id
+
     @classmethod
     def arg_resource_group__default(cls):
         '''
@@ -1257,9 +1304,10 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
     @property
     def require_msi(self):
         '''
-        Return true if only managed_identity credentials must be used
+        Return true if only managed_identity credentials must be used.
+        This is the case when _pin_client_id is set.
         '''
-        return bool(self._managed_identity_client_id)
+        return bool(self._pin_client_id)
 
     @property
     def managed_identity_name(self):
@@ -1294,16 +1342,19 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
         '''
         Getter
         '''
+        if self._pin_client_id:
+            return self._pin_client_id
+        if not self.managed_identity_azrid:
+            return None
         with self._managed_identity_lock:
-            if not self._managed_identity_client_id:
-                uami = self.user_assigned_identity_get(subscription_id=self.managed_identity_azrid.subscription_id,
-                                                       resource_group=self.managed_identity_azrid.resource_group_name,
-                                                       name=self.managed_identity_azrid.resource_name)
+            if not self._managed_identity_client_id_for_name:
+                uami = self.user_assigned_identity_get_by_id(self.managed_identity_azrid)
                 if not uami:
                     if self._managed_identity_name.lower() == str(self.managed_identity_azrid).lower():
                         raise self.exc_value(f"managed_identity {self.managed_identity_azrid}) not found")
                     raise self.exc_value(f"managed_identity {self._managed_identity_name!r} (id {self.managed_identity_azrid}) not found")
-            return self._managed_identity_client_id
+                self._managed_identity_client_id_for_name = uami.client_id
+            return self._managed_identity_client_id_for_name
 
     def nic_create_parameters(self, vmdesc, network_security_group_id=None, subnet_id=None, tags=None):
         '''
@@ -1313,7 +1364,12 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
         '''
         if not self.vm_resource_group:
             raise ApplicationExit("'vm_resource_group' not specified")
-        subnet_id = subnet_id or self.subnet_id_validate(exit_on_error=True)
+        if not subnet_id:
+            rg = self.vnet_resource_group_name or self.resource_group
+            subnet_obj = self.subnet_get(vnet_resource_group_name=rg, vnet_name=self.vnet_name, subnet_name=self.subnet_name)
+            if not subnet_obj:
+                raise ApplicationExit(f"resource_group {rg!r} vnet {self.vnet_name!r} subnet {self.subnet_name!r} not found")
+            subnet_id = subnet_obj.id
         network_security_group_id = self.network_security_group_id_effective(network_security_group_id, resource_group=self.resource_group)
         assert network_security_group_id
         nic_parameters = {'enable_accelerated_networking' : bool(vmdesc.accelerated_networking),
@@ -1370,40 +1426,6 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
         return delete_op
 
     @command.printable
-    def nsg_get(self, nsg_name=None, resource_group=None):
-        '''
-        Retrieve info for a Network Security Group
-        '''
-        nsg_name = nsg_name or self.nsg_name
-        if not nsg_name:
-            raise ApplicationExit("'nsg_name' not specified")
-        resource_group = resource_group or self.resource_group
-        if not resource_group:
-            raise ApplicationExit("'resource_group' not specified")
-        return self._nsg_get(nsg_name, resource_group)
-
-    def _nsg_get(self, nsg_name, resource_group):
-        '''
-        Return NetworkSecurityGroup or None
-        '''
-        try:
-            return self.az_network.network_security_groups.get(resource_group, nsg_name)
-        except Exception as exc:
-            caught = laaso.msapicall.Caught(exc)
-            if caught.is_missing():
-                return None
-            raise
-
-    def nsg_get_by_id(self, nsg_id):
-        '''
-        Given a network security group id such as:
-          /subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/infra-rg/providers/Microsoft.Network/networkSecurityGroups/some-nsg
-        do a get and return the result obj or None for not-found.
-        '''
-        azrid = AzResourceId.from_text(nsg_id, subscription_id=self.subscription_id, provider_name='Microsoft.Network', resource_type='networkSecurityGroups')
-        return self.nsg_get(resource_group=azrid.resource_group_name, nsg_name=azrid.resource_name)
-
-    @command.printable
     def nic_get(self, resource_group=None, nic_name=None):
         '''
         Return azure.mgmt.network.models.NetworkInterface or None
@@ -1449,10 +1471,10 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
         Return list of NICs belonging to VMs in resource group that are
         not tagged with status "discarded".
         '''
-        vm_list = self.vm_list_in_resource_group(resource_group)
+        vm_list = self.vm_list(resource_group=resource_group)
         nic_list = list()
         for vm in vm_list:
-            if vm.tags.get('status', '') == 'discarded':
+            if vm.tags and vm.tags.get('status', '') == 'discarded':
                 continue
             for nic in vm.network_profile.network_interfaces:
                 nic = self.nic_get_by_id(nic.id)
@@ -1472,76 +1494,6 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
             nic_name = nic_id_split[-1]
             nic_rg = nic_id_split[4]
             return self.nic_get(resource_group=nic_rg, nic_name=nic_name)
-
-    @command.printable
-    def vnet_get(self, vnet_resource_group_name=None, vnet_name=None):
-        '''
-        Return vnet object (VirtualNetwork)
-        '''
-        vnet_name, vnet_resource_group_name = self._vnet_name_get(vnet_name=vnet_name, vnet_resource_group_name=vnet_resource_group_name)
-        try:
-            self.logger.debug("vnet_get: %r/%r/%r/%r", self.subscription_id, self.location, vnet_resource_group_name, vnet_name)
-            return self.az_network.virtual_networks.get(vnet_resource_group_name, vnet_name)
-        except Exception as exc:
-            caught = laaso.msapicall.Caught(exc)
-            if caught.is_missing():
-                return None
-            raise
-
-    def _vnet_name_get(self, vnet_name=None, vnet_resource_group_name=None):
-        '''
-        Return effective tuple (vnet_name, vnet_resource_group_name),
-        raising as necessary.
-        '''
-        vnet_name = vnet_name or self.vnet_name
-        if not vnet_name:
-            self.logger.error("'vnet_name' not specified")
-            raise ApplicationExit(1)
-        vnet_resource_group_name = vnet_resource_group_name or self.vnet_resource_group_name
-        if not vnet_resource_group_name:
-            self.logger.error("'vnet_resource_group_name' not specified")
-            raise ApplicationExit(1)
-        return (vnet_name, vnet_resource_group_name)
-
-    def subnet_name_get(self, vnet_name=None, subnet_name=None, vnet_resource_group_name=None):
-        '''
-        Return effective tuple (vnet_name, subnet_name, vnet_resource_group_name),
-        raising as necessary.
-        '''
-        vnet_name, vnet_resource_group_name = self._vnet_name_get(vnet_name=vnet_name, vnet_resource_group_name=vnet_resource_group_name)
-        subnet_name = subnet_name or self.subnet_name
-        if not subnet_name:
-            self.logger.error("'subnet_name' not specified")
-            raise ApplicationExit(1)
-        return (vnet_name, subnet_name, vnet_resource_group_name)
-
-    def subnet_get_by_id(self, subnet_id):
-        '''
-        Given a subnet id ('/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/infra-rg/providers/Microsoft.Network/virtualNetworks/laaso-vnet/subnets/default'),
-        do a get and return the result obj or None for not-found.
-        '''
-        azrid = AzSubResourceId.from_text(subnet_id, subscription_id=self.subscription_id, provider_name='Microsoft.Network', resource_type='virtualNetworks', subresource_type='subnets')
-        try:
-            return self.az_network.subnets.get(azrid.resource_group_name, azrid.resource_name, azrid.subresource_name)
-        except Exception as exc:
-            caught = laaso.msapicall.Caught(exc)
-            if caught.is_missing():
-                return None
-            raise
-
-    def virtual_network_peering_get_by_id(self, peering_id):
-        '''
-        Given a peering id ('/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/infra-rg/providers/Microsoft.Network/virtualNetworks/laaso-vnet/virtualNetworkPeerings/general-2-eastus2-vnet-peering'),
-        do a get and return the result obj (VirtualNetworkPeering) or None for not-found.
-        '''
-        azrid = AzSubResourceId.from_text(peering_id, subscription_id=self.subscription_id, provider_name='Microsoft.Network', resource_type='virtualNetworks', subresource_type='virtualNetworkPeerings')
-        try:
-            return self.az_network.virtual_network_peerings.get(azrid.resource_group_name, azrid.resource_name, azrid.subresource_name)
-        except Exception as exc:
-            caught = laaso.msapicall.Caught(exc)
-            if caught.is_missing():
-                return None
-            raise
 
     def public_ip_get(self, public_ip_name=None, resource_group=None):
         '''
@@ -1566,33 +1518,6 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
             if caught.is_missing():
                 return None
             raise
-
-    @command.printable
-    def subnet_get(self, vnet_name=None, subnet_name=None, vnet_resource_group_name=None):
-        '''
-        Get the subnet object
-        '''
-        vnet_name, subnet_name, vnet_resource_group_name = self.subnet_name_get(vnet_name=vnet_name, subnet_name=subnet_name, vnet_resource_group_name=vnet_resource_group_name)
-        try:
-            return self.az_network.subnets.get(vnet_resource_group_name, vnet_name, subnet_name)
-        except Exception as exc:
-            caught = laaso.msapicall.Caught(exc)
-            if caught.is_missing():
-                return None
-            raise
-
-    def subnet_id_validate(self, exit_on_error=False):
-        '''
-        Compose and return the subnet_id. This verifies that the subnet
-        exists. If it does not exist, returns None.
-        '''
-        subnet_obj = self.subnet_get()
-        if subnet_obj:
-            return subnet_obj.id
-        if exit_on_error:
-            self.logger.error("resource_group %r vnet %r subnet %r not found", self.vnet_resource_group_name, self.vnet_name, self.subnet_name)
-            raise ApplicationExit(1)
-        return None
 
     def tags_get(self, *args, **kwargs):
         '''
@@ -1654,6 +1579,9 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
         '''
         image_reference = self.vm_image_reference(image_id)
 
+        adminpw = f"{vmdesc.vm_name}-apw"
+        output_redact('admin_password', adminpw)
+
         vm_parameters = {'diagnostics_profile' : {'boot_diagnostics' : {'enabled' : bool(vmdesc.boot_diag_enable)},
                                                  },
                          'hardware_profile' : {'vm_size' : vmdesc.vm_size,
@@ -1661,7 +1589,7 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
                          'location' : self.location,
                          'network_profile' : {'network_interfaces' : nic_list,
                                              },
-                         'os_profile' : {'admin_password' : vmdesc.vm_name,
+                         'os_profile' : {'admin_password' : adminpw,
                                          'admin_username' : admin_username,
                                          'computer_name' : vmdesc.vm_name,
                                          'custom_data' : vmdesc.custom_data,
@@ -1710,6 +1638,16 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
         A polling op is a result from a long-running operation such as vm.begin_create_or_update
         or deployments.begin_create_or_update.
         '''
+        if isinstance(op, azure.mgmt.resource.resources.models.DeploymentExtended):
+            try:
+                # Not really a polling op - the deployment is running in the background,
+                # and this is the result of creating the deployment.
+                # There's no operation_id in this object, so return what we have.
+                return op.properties.correlation_id
+            except Exception as exc:
+                self.logger.warning("%s op.properties.correlation_id %r", self.mth(), exc)
+            return None
+
         operation_id = getattr(op, 'operation_id', None)
         if operation_id:
             return operation_id
@@ -1769,8 +1707,8 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
             # wrapper. Either way, it is more likely that the operation should not have
             # an ID (for example, a no-op patch) than it is that this is a problem, so only
             # log a warning when there is no operation_id attribute.
-            if not hasattr(self, 'operation_id'):
-                self.logger.warning("%s op._polling_method._operation.location_url %r; returning None", self.mth(), location_url)
+            if not hasattr(_operation, 'operation_id'):
+                self.logger.warning("%s op._polling_method._operation.location_url for %s is %r; returning None", self.mth(), type(_operation), location_url)
             return None
 
         try:
@@ -1875,6 +1813,18 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
         subscription_id = subscription_id or self.subscription_id
         return self._vm_get(subscription_id, resource_group, vm_name)
 
+    def vm_get_by_id(self, vm_id):
+        '''
+        Given vm_id as resource_id str or AzResourceId, return azure.mgmt.compute.models.VirtualMachine or None
+        '''
+        if isinstance(vm_id, AzResourceId):
+            azrid = vm_id
+        else:
+            azrid = AzResourceId.from_text(vm_id)
+        if not azrid.values_match(provider_name='Microsoft.Compute', resource_type='virtualMachines'):
+            raise ValueError(f"{azrid!r} is not a virtual machine resource")
+        return self._vm_get(azrid.subscription_id, azrid.resource_group_name, azrid.resource_name)
+
     def _vm_get(self, subscription_id, resource_group, vm_name):
         '''
         Return VirtualMachine or None
@@ -1965,34 +1915,44 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
         else:
             print("'%s' not found in resource_group '%s'" % (vm_name, self.vm_resource_group))
 
-    def _msi_clientids_get(self, client_id=None):
+    def client_ids_get(self, add_default_creds=False, client_id=None):
         '''
         Return a list of client_ids caller can use to iterate through the VM's assigned identities
         order of precedence:
          1. client_id argument
-         2. self.managed_identity_client_id
+         2. self._pin_client_id
+            When self._pin_client_id is set, we are pinned to doing all
+            auth with it. self.managed_identity_client_id evaluates to this, but when
+            managed_identity is provided at init time and managed_identity_client_id
+            is not, we are not pinned, and the self.managed_identity_client_id getter
+            will attempt to fetch the ARM resource for self.managed_identity_azrid.
+            We do not want that here, because we are not pinned to using
+            managed_identity_client_id, and attempting to do so creates a recursive
+            call, because that getter could be calling us.
          3. self.clientids_dict (loaded from clientids file)
         The returned list is guaranteed unique, not shared
+        For convenience, when client_id is a sequence, the caller may include
+        the value None as shorthand for add_default_creds=True.
         '''
-        if isinstance(client_id, list):
-            # API simplification: this allows a high-level caller to assemble
-            # their own ordered list.
-            ret = list()
-            for x in client_id:
-                ret.extend(self._msi_clientids_get(client_id=x))
-            return ret
-        if client_id or self.require_msi:
-            if client_id:
-                val = laaso.identity.client_id_from_uami_str(client_id, self, resolve_using_azmgr=False)
-                ret = [val or self.managed_identity_client_id]
+        client_id = client_id or self._pin_client_id
+        ret = list()
+        if client_id:
+            if isinstance(client_id, (list, tuple)):
+                for x in client_id:
+                    if not x:
+                        add_default_creds = True
+                    else:
+                        ret.extend(self.client_ids_get(client_id=x))
             else:
-                ret = [self.managed_identity_client_id]
+                if isinstance(client_id, AzCred):
+                    ret.append(client_id)
+                else:
+                    ret.append(laaso.identity.client_id_from_uami_str(client_id, self, resolve_using_azmgr=False))
         elif self.clientids_dict:
-            ret = list(self.clientids_dict.values())
-        else:
-            ret = list()
-        if not (self.require_msi or client_id):
-            # Caller wants to try everything - try no client_id, which falls back to default creds
+            ret.extend(self.clientids_dict.values())
+        if not (self._pin_client_id or client_id):
+            add_default_creds = True
+        if add_default_creds:
             ret.append(None)
         return ret
 
@@ -2097,52 +2057,6 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
         self.logger.warning("no primary config found for NIC %s", nic_info.id)
         return None
 
-    def _loganalytics_workspace_get_shared_keys(self, subscription_id, resource_group, workspace_name):
-        '''
-        Return azure.mgmt.loganalytics.models.SharedKeys or None
-        '''
-        try:
-            az_loganalytics = self.az_loganalytics_get(subscription_id)
-            return az_loganalytics.shared_keys.get_shared_keys(resource_group, workspace_name)
-        except Exception as exc:
-            caught = laaso.msapicall.Caught(exc)
-            if caught.is_missing():
-                return None
-            raise
-
-    def _loganalytics_workspace_get(self, subscription_id, resource_group, workspace_name):
-        '''
-        Return azure.mgmt.loganalytics.models.Workspace or None
-        '''
-        try:
-            az_loganalytics = self.az_loganalytics_get(subscription_id)
-            return az_loganalytics.workspaces.get(resource_group, workspace_name)
-        except Exception as exc:
-            caught = laaso.msapicall.Caught(exc)
-            if caught.is_missing():
-                return None
-            raise
-
-    def loganalytics_workspace_get_shared_keys(self, resource_group, workspace_name, subscription_id=None):
-        '''
-        Return azure.mgmt.loganalytics.models.SharedKeys or None
-        '''
-        subscription_id = subscription_id or self.subscription_id
-        ret = self._loganalytics_workspace_get_shared_keys(subscription_id, resource_group, workspace_name)
-        if ret:
-            for attr in ('primary_shared_key', 'secondary_shared_key'):
-                sk = getattr(ret, attr, '')
-                if sk:
-                    output_redact(workspace_name+'.'+attr, sk)
-        return ret
-
-    def loganalytics_workspace_get(self, resource_group, workspace_name, subscription_id=None):
-        '''
-        Return azure.mgmt.loganalytics.models.Workspace or None
-        '''
-        subscription_id = subscription_id or self.subscription_id
-        return self._loganalytics_workspace_get(subscription_id, resource_group, workspace_name)
-
     @command.printable
     def deployment_get(self, deployment_name, resource_group=None, subscription_id=None, pretty=False):
         '''
@@ -2161,6 +2075,7 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
             deployment = az_resource.deployments.get(deployment_name=deployment_name, resource_group_name=resource_group)
         except Exception as exc:
             caught = laaso.msapicall.Caught(exc)
+            self.logger.info('exception raised while deploying %r in RG %r', deployment_name, resource_group)
             if caught.is_missing():
                 return None
             raise
@@ -2300,7 +2215,7 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
     @command.simple
     def resource_group_create(self, resource_group=None, location=None, tags=None):
         '''
-        Create resource_group
+        Create resource_group. Return azure.mgmt.resource.resources.models.ResourceGroup.
         '''
         resource_group = resource_group or self.resource_group
         location = location or self.location
@@ -2311,7 +2226,7 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
                       'tags': self.tags_get(tags),
                       }
         self.logger.info("create resource_group %s with parameters:\n%s", resource_group, expand_item_pformat(parameters))
-        res = self.az_resource.resource_groups.begin_create_or_update(resource_group, parameters)
+        res = self._resource_group_create_or_update(resource_group, parameters)
         self.logger.info("resource_group %s create result:\n%s", resource_group, expand_item_pformat(res))
         if res:
             self._resource_groups_created.append(res)
@@ -2356,18 +2271,6 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
         op.wait()
         if verbose:
             self.logger.info("resource group %s deleted", resource_group)
-
-    @staticmethod
-    def vm_custom_data_from_file(filename):
-        '''
-        Read filename, base64 encode it, and return it.
-        '''
-        with open(laaso.paths.repo_root_path(filename), 'rb') as f:
-            data = f.read()
-        ret = str(base64.b64encode(data), encoding='ascii')
-        if len(ret) > VM_CUSTOM_DATA_LEN_MAX:
-            raise ApplicationExit("vm_custom_data_filename %r is too long (%s > %s)" % (filename, len(ret), VM_CUSTOM_DATA_LEN_MAX))
-        return ret
 
     def vmdescs_generate(self, vm_names, nic_names=None, custom_data=None, public_ip_id=None):
         '''
@@ -2788,32 +2691,6 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
                     return True
         return False
 
-    @command.printable
-    def vm_list_in_resource_group(self, resource_group=None):
-        '''
-        List VMs in the resource_group.
-        '''
-        resource_group = resource_group or self.resource_group
-        if not resource_group:
-            self.logger.error("'resource_group' not specified")
-            raise ApplicationExit(1)
-        return list(self.az_compute.virtual_machines.list(resource_group))
-
-    @command.simple
-    def rg_vm_print(self, resource_group=None, fullid=False):
-        '''
-        print() names and network addresses of VMs in a resource group
-        '''
-        vm_objs = self.vm_list_in_resource_group(resource_group=resource_group)
-        vm_objs.sort(key=lambda x: x.name)
-        vals = list()
-        for vm_obj in vm_objs:
-            val = [vm_obj.id] if fullid else [vm_obj.name]
-            n = self.vm_primary_nic_addr_get(vm_obj)
-            val.append(n or '')
-            vals.append(val)
-        print(tabulate(vals, tablefmt='plain', numalign='left', stralign='left'))
-
     @command.simple
     def image_gallery_create(self, resource_group=None, gallery_name=None, tags=None):
         '''
@@ -3067,34 +2944,28 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
         # The SDK does not deal well with invalid storage account names.
         # See if we can reach blob_url (does not matter that we will most likely get a 400).
         if not self._blobserviceclient_get__url_is_valid(blob_url):
+            self.logger.warning("%s: invalid blob_url %r", self.mth(), blob_url)
             return None
+        bsc_kwargs = dict()
         if credential:
-            return BlobServiceClient(blob_url, credential=credential)
-        if sas_token:
-            return BlobServiceClient(blob_url, credential=sas_token)
-        if storage_account_key:
-            return BlobServiceClient(blob_url, credential=storage_account_key)
-        # No auth provided. If we can retrieve SA keys, use one. If not, try using our own creds.
-        # Most likely our own creds will fail in that case. Sorry.
-        cred = self.azure_credential_generate()
-        keys = self.storage_account_keys_get(storage_account_name=storage_account_name, storage_account_resource_group_name=storage_account_resource_group_name)
-        if keys and keys[0]:
-            cred = keys[0]
-        return BlobServiceClient(blob_url, credential=cred)
-
-    def resource_list_storage_accounts(self):
-        '''
-        Return a list of all storage accounts in the default subscription.
-        Returns an empty list (not None) if the subscription does not exist.
-        This trivial wrappper provides a useful hook for testing (mocking).
-        '''
-        try:
-            return self.az_resource.resources.list("resourceType eq 'Microsoft.Storage/storageAccounts'")
-        except Exception as exc:
-            caught = laaso.msapicall.Caught(exc)
-            if caught.is_missing():
-                return list()
-            raise
+            bsc_kwargs['credential'] = credential
+        elif sas_token:
+            bsc_kwargs['credential'] = sas_token
+        elif storage_account_key:
+            bsc_kwargs['credential'] = storage_account_key
+        else:
+            # No auth provided. If we can retrieve SA keys, use one. If not, try using our own creds.
+            # Most likely our own creds will fail in that case. Sorry.
+            cred = self.azure_credential_generate()
+            keys = self.storage_account_keys_get(storage_account_name=storage_account_name, storage_account_resource_group_name=storage_account_resource_group_name)
+            if keys and keys[0]:
+                bsc_kwargs['credential'] = keys[0]
+            else:
+                bsc_kwargs['credential'] = cred
+        ret = msapicall(self.logger, BlobServiceClient, blob_url, **bsc_kwargs)
+        if not ret:
+            self.logger.warning("%s: returning BlobServiceClient %r", self.mth(), ret)
+        return ret
 
     def blobop_bundle_get(self, name, *args, skc=None, storage_account_resource_group_name=None, storage_account_key=None, sas_token=None, credential=None, **kwargs):
         '''
@@ -3131,6 +3002,493 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
             raise
 
     ######################################################################
+    # Subscription mgmt
+
+    def subscription_list(self):
+        '''
+        List subscriptions available to this auth.
+        Return a list of azure.mgmt.subscription.models.Subscription.
+        '''
+        return self._subscription_list()
+
+    def _subscription_list(self):
+        '''
+        List subscriptions available to this auth.
+        Return a list of azure.mgmt.subscription.models.Subscription.
+        '''
+        try:
+            return list(self.az_subscription.subscriptions.list())
+        except Exception as exc:
+            caught = laaso.msapicall.Caught(exc)
+            if caught.is_missing():
+                return None
+            raise
+
+    def subscription_id_from_display_name(self, display_name):
+        '''
+        Return the subscription_id for the subscription with the
+        given display name. If display_name is not found, return None.
+        This means that if the caller does not have permission to
+        access the subscription, this will return None.
+        '''
+        subs = self.subscription_list()
+        for sub in subs:
+            if sub.display_name == display_name:
+                return sub.subscription_id
+        return None
+
+    ######################################################################
+    # VM mgmt
+
+    VM_AZRID_VALUES = {'provider_name' : 'Microsoft.Compute',
+                       'resource_type' : 'virtualMachines',
+                      }
+
+    @classmethod
+    def vm_azrid_build(cls, subscription_id, resource_group, resource_name):
+        '''
+        Build azrid
+        '''
+        return AzResourceId.build(subscription_id, resource_group, resource_name, cls.VM_AZRID_VALUES)
+
+    @classmethod
+    def vm_azrid(cls, resource_id):
+        '''
+        Return resource_id in AzResourceId form.
+        '''
+        return azrid_normalize(resource_id, AzResourceId, cls.VM_AZRID_VALUES)
+
+    @classmethod
+    def is_vm_resource_id(cls, resource_id):
+        '''
+        Return whether resource_id is a VM resource_id
+        '''
+        azrid = azrid_normalize_or_none(resource_id, AzResourceId, cls.VM_AZRID_VALUES)
+        return azrid and azrid_is(azrid, AzResourceId, **cls.VM_AZRID_VALUES)
+
+    @command.printable
+    def vm_list(self, subscription_id=None, resource_group=None):
+        '''
+        List virtual machines in a subscription. If not specified explicitly, self.subscription_id is used.
+        May optionally limit to a resource_group.
+        Return a list of azure.mgmt.compute.models.VirtualMachine
+        '''
+        subscription_id = laaso.subscription_mapper.effective(subscription_id or self.subscription_id)
+        resource_group = resource_group or None
+        return self._vm_list(subscription_id, resource_group)
+
+    def _vm_list(self, subscription_id, resource_group):
+        '''
+        List virtual machines in a subscription.
+        If resource_group is truthy, restrict the list to the named RG.
+        Return a list of azure.mgmt.compute.models.VirtualMachine
+        '''
+        az_compute = self.az_compute_get(subscription_id)
+        try:
+            if resource_group:
+                return list(az_compute.virtual_machines.list(resource_group))
+            return list(az_compute.virtual_machines.list_all())
+        except Exception as exc:
+            caught = laaso.msapicall.Caught(exc)
+            if caught.is_missing():
+                return list()
+            raise
+
+    ######################################################################
+    # loganalytics_workspace
+
+    LOGANALYTICS_WORKSPACE_AZRID_VALUES = {'provider_name' : 'Microsoft.OperationalInsights',
+                                           'resource_type' : 'workspaces',
+                                          }
+
+    @classmethod
+    def loganalytics_workspace_azrid(cls, resource_id):
+        '''
+        Return resource_id in AzResourceId form.
+        '''
+        return azrid_normalize(resource_id, AzResourceId, cls.LOGANALYTICS_WORKSPACE_AZRID_VALUES)
+
+    @classmethod
+    def loganalytics_workspace_resource_type(cls):
+        '''
+        Return the resource type string - eg x.type where x is the SDK resource obj.
+        '''
+        v = cls.LOGANALYTICS_WORKSPACE_AZRID_VALUES
+        return f"{v['provider_name']}/{v['resource_type']}"
+
+    @classmethod
+    def loganalytics_workspace_obj_normalize(cls, obj):
+        '''
+        The OperationalInsights RP returns some strings with
+        nonstandard and even inconsistent case. Normalize
+        these strings to a consistent form.
+        '''
+        if obj:
+            obj = copy.deepcopy(obj)
+            obj = cls.sdk_resource_obj_normalize(obj, cls.LOGANALYTICS_WORKSPACE_AZRID_VALUES, cls.loganalytics_workspace_resource_type(), docopy=False)
+            if obj.sku and obj.sku.name:
+                obj.sku.name = laaso.util.enum_str_normalize_nocase(azure.mgmt.loganalytics.models.WorkspaceSkuNameEnum, obj.sku.name)
+        return obj
+
+    def _loganalytics_workspace_get(self, azrid):
+        '''
+        Return azure.mgmt.loganalytics.models.Workspace or None
+        '''
+        try:
+            az_loganalytics = self.az_loganalytics_get(azrid.subscription_id)
+            return az_loganalytics.workspaces.get(azrid.resource_group_name, azrid.resource_name)
+        except Exception as exc:
+            caught = laaso.msapicall.Caught(exc)
+            if caught.is_missing():
+                return None
+            raise
+
+    def loganalytics_workspace_get_by_id(self, resource_id):
+        '''
+        Return azure.mgmt.loganalytics.models.Workspace or None
+        '''
+        resource_id = self.loganalytics_workspace_azrid(resource_id)
+        ret = self._loganalytics_workspace_get(resource_id)
+        ret = self.loganalytics_workspace_obj_normalize(ret)
+        return ret
+
+    def loganalytics_workspace_get_shared_keys(self, workspace_id):
+        '''
+        Return azure.mgmt.loganalytics.models.SharedKeys or None
+        '''
+        workspace_azrid = self.loganalytics_workspace_azrid(workspace_id)
+        workspace_name = workspace_azrid.resource_name
+        ret = self._loganalytics_workspace_get_shared_keys(workspace_azrid)
+        if ret:
+            for attr in ('primary_shared_key', 'secondary_shared_key'):
+                sk = getattr(ret, attr, '')
+                if sk:
+                    output_redact(workspace_name+'.'+attr, sk)
+        return ret
+
+    def _loganalytics_workspace_get_shared_keys(self, azrid):
+        '''
+        Return azure.mgmt.loganalytics.models.SharedKeys or None
+        '''
+        try:
+            az_loganalytics = self.az_loganalytics_get(azrid.subscription_id)
+            return az_loganalytics.shared_keys.get_shared_keys(azrid.resource_group_name, azrid.resource_name)
+        except Exception as exc:
+            caught = laaso.msapicall.Caught(exc)
+            if caught.is_missing():
+                return None
+            raise
+
+    def loganalytics_workspace_create_or_update(self, azrid, params):
+        '''
+        Create or update for loganalytics workspace
+        Returns azure.mgmt.loganalytics.models.Workspace
+        '''
+        azrid.values_sanity(self.LOGANALYTICS_WORKSPACE_AZRID_VALUES)
+        ret = self._loganalytics_workspace_create_or_update(azrid, params)
+        ret = self.loganalytics_workspace_obj_normalize(ret)
+        return ret
+
+    def _loganalytics_workspace_create_or_update(self, azrid, params):
+        '''
+        Create or update for loganalytics workspace
+        Returns azure.mgmt.loganalytics.models.Workspace
+        '''
+        az_loganalytics = self.az_loganalytics_get(azrid.subscription_id)
+        poller = self.arm_poller(az_loganalytics.workspaces)
+        op = az_loganalytics.workspaces.begin_create_or_update(azrid.resource_group_name, azrid.resource_name, params, polling=poller)
+        op.wait()
+        return op.result()
+
+    ######################################################################
+    # Peering (virtual network)
+
+    VIRTUAL_NETWORK_PEERING_AZRID_VALUES = {'provider_name' : 'Microsoft.Network',
+                                            'resource_type' : 'virtualNetworks',
+                                            'subresource_type' : 'virtualNetworkPeerings',
+                                           }
+
+    @classmethod
+    def virtual_network_peering_azrid(cls, resource_id):
+        '''
+        Given a virtual network peering (peering_id), return it in AzSubResourceId form.
+        '''
+        return azrid_normalize(resource_id, AzSubResourceId, cls.VIRTUAL_NETWORK_PEERING_AZRID_VALUES)
+
+    def virtual_network_peering_get_by_id(self, peering_id):
+        '''
+        Given a peering id ('/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/infra-rg/providers/Microsoft.Network/virtualNetworks/laaso-vnet/virtualNetworkPeerings/general-2-eastus2-vnet-peering'),
+        do a get and return the result obj (azure.mgmt.network.models.VirtualNetworkPeering) or None for not-found.
+        '''
+        azrid = self.virtual_network_peering_azrid(peering_id)
+        return self._virtual_network_peering_get(azrid)
+
+    def _virtual_network_peering_get(self, peering_azrid):
+        '''
+        Return azure.mgmt.network.models.VirtualNetworkPeering or None
+        '''
+        az_network = self.az_network_get(peering_azrid.subscription_id)
+        try:
+            return az_network.virtual_network_peerings.get(peering_azrid.resource_group_name, peering_azrid.resource_name, peering_azrid.subresource_name)
+        except Exception as exc:
+            caught = laaso.msapicall.Caught(exc)
+            if caught.is_missing():
+                return None
+            raise
+
+    def virtual_network_peering_create(self, resource_group, vnet_name, peering_name, params):
+        '''
+        Create a single vnet peering.
+        Return azure.mgmt.network.models.VirtualNetworkPeering.
+        Remember, two of these are needed to pass traffic; on each vnet.
+        '''
+        return self._virtual_network_peering_create(resource_group, vnet_name, peering_name, params)
+
+    def _virtual_network_peering_create(self, resource_group, vnet_name, peering_name, params):
+        '''
+        Create a single vnet peering. Returns azure.mgmt.network.models.VirtualNetworkPeering.
+        '''
+        poller = self.arm_poller(self.az_network.virtual_network_peerings)
+        op = self.az_network.virtual_network_peerings.begin_create_or_update(resource_group, vnet_name, peering_name, params, polling=poller)
+        op.wait()
+        return op.result()
+
+    ######################################################################
+    # Subnet
+
+    VIRTUAL_NETWORK_SUBNET_AZRID_VALUES = {'provider_name' : 'Microsoft.Network',
+                                           'resource_type' : 'virtualNetworks',
+                                           'subresource_type' : 'subnets',
+                                          }
+
+    @classmethod
+    def subnet_azrid(cls, resource_id):
+        '''
+        Return resource_id in AzSubResourceId form.
+        '''
+        return azrid_normalize(resource_id, AzSubResourceId, cls.VIRTUAL_NETWORK_SUBNET_AZRID_VALUES)
+
+    def subnet_name_get(self, vnet_name=None, subnet_name=None, vnet_resource_group_name=None):
+        '''
+        Return effective tuple (vnet_name, subnet_name, vnet_resource_group_name),
+        raising as necessary.
+        '''
+        vnet_name, vnet_resource_group_name = self._vnet_name_get(vnet_resource_group_name, vnet_name)
+        subnet_name = subnet_name or self.subnet_name
+        if not subnet_name:
+            raise ApplicationExit("'subnet_name' not specified")
+        return (vnet_name, subnet_name, vnet_resource_group_name)
+
+    def subnet_get_by_id(self, subnet_id):
+        '''
+        Given a subnet id ('/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/infra-rg/providers/Microsoft.Network/virtualNetworks/laaso-vnet/subnets/default'),
+        do a get and return the result obj or None for not-found.
+        '''
+        azrid = azrid_normalize(subnet_id, AzSubResourceId, self.VIRTUAL_NETWORK_SUBNET_AZRID_VALUES)
+        return self._subnet_get(azrid.subscription_id, azrid.resource_group_name, azrid.resource_name, azrid.subresource_name)
+
+    @command.printable
+    def subnet_get(self, subscription_id=None, vnet_resource_group_name=None, vnet_name=None, subnet_name=None):
+        '''
+        Return azure.mgmt.network.models.Subnet or None
+        '''
+        subscription_id = subscription_id or self.subscription_id
+        vnet_name, subnet_name, vnet_resource_group_name = self.subnet_name_get(vnet_name=vnet_name, subnet_name=subnet_name, vnet_resource_group_name=vnet_resource_group_name)
+        return self._subnet_get(subscription_id, vnet_resource_group_name, vnet_name, subnet_name)
+
+    def _subnet_get(self, subscription_id, resource_group, vnet_name, subnet_name):
+        '''
+        Return azure.mgmt.network.models.Subnet or None
+        '''
+        az_network = self.az_network_get(subscription_id)
+        try:
+            return az_network.subnets.get(resource_group, vnet_name, subnet_name)
+        except Exception as exc:
+            caught = laaso.msapicall.Caught(exc)
+            if caught.is_missing():
+                return None
+            raise
+
+    def subnet_create_or_update(self, azrid, params):
+        '''
+        Return azure.mgmt.network.models.Subnet
+        '''
+        azrid.values_sanity(self.VIRTUAL_NETWORK_SUBNET_AZRID_VALUES)
+        return self._subnet_create_or_update(azrid, params)
+
+    def _subnet_create_or_update(self, azrid, params):
+        '''
+        Return azure.mgmt.network.models.Subnet
+        '''
+        az_network = self.az_network_get(azrid.subscription_id)
+        poller = self.arm_poller(az_network.subnets)
+        op = az_network.subnets.begin_create_or_update(azrid.resource_group_name, azrid.resource_name, azrid.subresource_name, params, polling=poller)
+        op.wait()
+        return op.result()
+
+    ######################################################################
+    # SKU
+
+    @command.simple
+    def skus_print_json(self):
+        '''
+        Print skus in JSON format
+        '''
+        sku_list = [x.serialize(keep_readonly=True) for x in self.skus_list()]
+        print(json.dumps(sku_list, indent=len(PF)))
+
+    ######################################################################
+    # resource_group
+
+    def _resource_group_create_or_update(self, resource_group, parameters):
+        '''
+        Perform the resource_group create_or_update.
+        Return azure.mgmt.resource.resources.models.ResourceGroup.
+        '''
+        return self.az_resource.resource_groups.create_or_update(resource_group, parameters)
+
+    ######################################################################
+    # NSG (Network Security Group)
+
+    NSG_AZRID_VALUES = {'provider_name' : 'Microsoft.Network',
+                        'resource_type' : 'networkSecurityGroups',
+                       }
+
+    @classmethod
+    def nsg_azrid_build(cls, subscription_id, resource_group, resource_name):
+        '''
+        Build azrid
+        '''
+        return AzResourceId.build(subscription_id, resource_group, resource_name, cls.NSG_AZRID_VALUES)
+
+    @command.printable
+    def nsg_get(self, nsg_name=None, resource_group=None):
+        '''
+        Return azure.mgmt.network.models.NetworkSecurityGroup or None
+        '''
+        nsg_name = nsg_name or self.nsg_name
+        if not nsg_name:
+            raise ApplicationExit("'nsg_name' not specified")
+        resource_group = resource_group or self.resource_group
+        if not resource_group:
+            raise ApplicationExit("'resource_group' not specified")
+        return self._nsg_get(nsg_name, resource_group)
+
+    def _nsg_get(self, nsg_name, resource_group):
+        '''
+        Return azure.mgmt.network.models.NetworkSecurityGroup or None
+        '''
+        try:
+            return self.az_network.network_security_groups.get(resource_group, nsg_name)
+        except Exception as exc:
+            caught = laaso.msapicall.Caught(exc)
+            if caught.is_missing():
+                return None
+            raise
+
+    def nsg_get_by_id(self, nsg_id):
+        '''
+        Given a network security group id such as:
+          /subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/infra-rg/providers/Microsoft.Network/networkSecurityGroups/some-nsg
+        return azure.mgmt.network.models.NetworkSecurityGroup or None
+        '''
+        azrid = AzResourceId.from_text(nsg_id, subscription_id=self.subscription_id, provider_name='Microsoft.Network', resource_type='networkSecurityGroups')
+        return self.nsg_get(resource_group=azrid.resource_group_name, nsg_name=azrid.resource_name)
+
+    def nsg_create_or_update(self, azrid, params):
+        '''
+        Issue a create_or_update for the given network security group.
+        Return azure.mgmt.network.models.NetworkSecurityGroup.
+        '''
+        assert azrid.values_match(provider_name='Microsoft.Network', resource_type='networkSecurityGroups')
+        return self._nsg_create_or_update(azrid, params)
+
+    def _nsg_create_or_update(self, azrid, params):
+        '''
+        Issue a create_or_update for the given network security group.
+        Return azure.mgmt.network.models.NetworkSecurityGroup.
+        '''
+        az_network = self.az_network_get(azrid.subscription_id)
+        poller = self.arm_poller(az_network.network_security_groups)
+        op = az_network.network_security_groups.begin_create_or_update(azrid.resource_group_name, azrid.resource_name, params, polling=poller)
+        op.wait()
+        return op.result()
+
+    ######################################################################
+    # vnet
+
+    VIRTUAL_NETWORK_AZRID_VALUES = {'provider_name' : 'Microsoft.Network',
+                                    'resource_type' : 'virtualNetworks',
+                                   }
+
+    @classmethod
+    def virtual_network_azrid(cls, resource_id):
+        '''
+        Return resource_id in AzResourceId form.
+        '''
+        return azrid_normalize(resource_id, AzResourceId, cls.VIRTUAL_NETWORK_AZRID_VALUES)
+
+    def _vnet_name_get(self, vnet_resource_group_name, vnet_name):
+        '''
+        Return effective tuple (vnet_name, vnet_resource_group_name),
+        raising as necessary.
+        '''
+        vnet_name = vnet_name or self.vnet_name
+        if not vnet_name:
+            self.logger.error("'vnet_name' not specified")
+            raise ApplicationExit(1)
+        vnet_resource_group_name = vnet_resource_group_name or self.vnet_resource_group_name
+        if not vnet_resource_group_name:
+            self.logger.error("'vnet_resource_group_name' not specified")
+            raise ApplicationExit(1)
+        return (vnet_name, vnet_resource_group_name)
+
+    def vnet_get_by_id(self, vnet_id):
+        '''
+        Return vnet object (azure.mgmt.network.models.VirtualNetwork) or None
+        '''
+        azrid = azrid_normalize(vnet_id, AzResourceId, self.VIRTUAL_NETWORK_AZRID_VALUES)
+        return self._vnet_get(azrid.subscription_id, azrid.resource_group_name, azrid.resource_name)
+
+    @command.printable
+    def vnet_get(self, vnet_resource_group_name=None, vnet_name=None):
+        '''
+        Return vnet object (azure.mgmt.network.models.VirtualNetwork) or None
+        '''
+        vnet_name, vnet_resource_group_name = self._vnet_name_get(vnet_resource_group_name, vnet_name)
+        return self._vnet_get(self.subscription_id, vnet_resource_group_name, vnet_name)
+
+    def _vnet_get(self, subscription_id, resource_group, vnet_name):
+        '''
+        Return vnet object (azure.mgmt.network.models.VirtualNetwork) or None
+        '''
+        az_network = self.az_network_get(subscription_id)
+        try:
+            return az_network.virtual_networks.get(resource_group, vnet_name)
+        except Exception as exc:
+            caught = laaso.msapicall.Caught(exc)
+            if caught.is_missing():
+                return None
+            raise
+
+    def vnet_create_or_update(self, azrid, params):
+        '''
+        azure.mgmt.network.models.VirtualNetwork
+        '''
+        assert azrid.values_match(provider_name='Microsoft.Network', resource_type='virtualNetworks')
+        return self._vnet_create_or_update(azrid, params)
+
+    def _vnet_create_or_update(self, azrid, params):
+        '''
+        azure.mgmt.network.models.VirtualNetwork
+        '''
+        az_network = self.az_network_get(azrid.subscription_id)
+        poller = self.arm_poller(az_network.subnets)
+        op = az_network.virtual_networks.begin_create_or_update(azrid.resource_group_name, azrid.resource_name, params, polling=poller)
+        op.wait()
+        return op.result()
+
+    ######################################################################
     # Resource IDs
 
     def resource_id_expand(self, resource_ids, exc_value=None, namestack=''):
@@ -3157,47 +3515,107 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
         return ret
 
     ######################################################################
+    # Resources
+
+    def resource_list(self, resource_type_match=None):
+        '''
+        Return a list of azure.mgmt.resource.resources.models.GenericResourceExpanded objects.
+        '''
+        return self._resource_list(resource_type_match)
+
+    def _resource_list(self, resource_type_match):
+        '''
+        List all resources in this subscription, returning a list of type azure.mgmt.resource.resources.models.GenericResourceExpanded
+        '''
+        lfilter = "resourceType eq %r" % resource_type_match if resource_type_match else None
+        try:
+            return list(self.az_resource.resources.list(filter=lfilter))
+        except Exception as exc:
+            caught = laaso.msapicall.Caught(exc)
+            if caught.is_missing():
+                return list()
+            raise
+
+    def resource_list_storage_accounts(self):
+        '''
+        Return a list of all storage accounts in the default subscription.
+        Returns an empty list (not None) if the subscription does not exist.
+        This trivial wrappper provides a useful hook for testing (mocking).
+        '''
+        return self.resource_list('Microsoft.Storage/storageAccounts')
+
+    ######################################################################
     # RBAC role assignments
 
-    def rbac_aad_principal_show_name_for_role_assignment(self, ra):
+    @staticmethod
+    def rbac_role_assignment_normalize(obj):
         '''
-        Given a role assignment (azure.mgmt.authorization.models.RoleAssignment),
-        return the logical name to show for ra.principal_id. Return '' if not
-        found or untranslatable. This is not necessarily the display_name; it
-        is whatever we are expecting as input to an rbac operation.
+        Handle converting preview API results.
+        Returns azure.mgmt.authorization.v2018_01_01_preview.models.RoleAssignment.
+        The preview version has a "nicer" object layout, and one might
+        reasonably presume that "someday" it will become azure.mgmt.authorization.models.RoleAssignment.
         '''
-        # I'd like to use the azure.mgmt.authorization.models.PrincipalType
-        # enum here for these strings, but that enum randomly appears and
-        # disappears in various versions of the SDK.
-        if ra.principal_type in ('Everyone', 'Unknown'):
-            return ra.principal_type
-        unknown = "unknown %s %s" % (ra.principal_type, ra.principal_id)
-        # This seems to work for various kinds of principal_type.
-        if ra.principal_type == 'User':
-            aad = self.ad_user_get(ra.principal_id)
-            return aad.user_principal_name if aad else unknown
-        if ra.principal_type == 'ServicePrincipal':
-            aad = self.ad_service_principal_get_by_object_id(ra.principal_id)
-            return aad.display_name if aad else unknown
-        self.logger.warning("%s unhandled principal_type %r", self.mth(), ra.principal_type)
-        return ''
+        if isinstance(obj, azure.mgmt.authorization.v2018_01_01_preview.models.RoleAssignment):
+            return obj
+        ret = azure.mgmt.authorization.v2018_01_01_preview.models.RoleAssignment()
+        if isinstance(obj, azure.mgmt.authorization.models.RoleAssignment):
+            ret.additional_properties = obj.additional_properties
+            ret.id = obj.id
+            ret.name = obj.name
+            ret.principal_id = obj.properties.principal_id
+            ret.role_definition_id = obj.properties.role_definition_id
+            ret.scope = obj.properties.scope
+            ret.type = obj.type
+        else:
+            raise ValueError(f"{getframe(0)}: unknown obj type {type(obj)}")
+        return ret
 
     def rbac_role_assignments_list_for_scope(self, azrid, lfilter=None):
         '''
-        Return a list of role assignments (azure.mgmt.authorization.models.RoleAssignment) for the scope defined by azrid
+        Return a list of role assignments (azure.mgmt.authorization.v2018_01_01_preview.models.RoleAssignment) for the scope defined by azrid.
+        Accepts azresourceid form because many callers have that in hand.
         '''
         if isinstance(azrid, str):
             azrid = azresourceid_from_text(azrid)
-        return self._rbac_role_assignments_list_for_scope(azrid, lfilter=lfilter)
+        ret = self._rbac_role_assignments_list_for_scope(azrid, lfilter=lfilter)
+        return [self.rbac_role_assignment_normalize(x) for x in ret]
 
     def _rbac_role_assignments_list_for_scope(self, azrid, lfilter=None):
         '''
-        Return a list of role assignments (azure.mgmt.authorization.models.RoleAssignment) for the scope (azrid).
+        Return a list of role assignments (azure.mgmt.authorization.v2018_01_01_preview.models.RoleAssignment) for the scope (azrid).
         Restrict to at or above the scope: lfilter='atScope()'
         Restrict to a specific principal_id: lfilter='principalId eq {id}'
         '''
         az_authorization = self.az_authorization_get(azrid.subscription_id)
         return list(az_authorization.role_assignments.list_for_scope(str(azrid), filter=lfilter))
+
+    def rbac_role_assignment_create(self, principal_id, principal_type, scope, role_definition_id):
+        '''
+        Create a new role assignment. Auto-generates the name.
+        '''
+        name = str(uuid.uuid4())
+        self._rbac_role_assignment_create(name, principal_id, principal_type, scope, role_definition_id)
+
+    def _rbac_role_assignment_create(self, name, principal_id, principal_type, scope, role_definition_id): # pylint: disable=unused-argument
+        '''
+        Create a new role assignment.
+        see:
+          https://docs.microsoft.com/en-us/rest/api/authorization/roleassignments/create
+          https://docs.microsoft.com/en-us/python/api/azure-mgmt-authorization/azure.mgmt.authorization.v2015_07_01.models.roleassignmentcreateparameters?view=azure-python
+        '''
+        # It looks like things are different in the v2020_04_01_preview. When
+        # that goes live, this may need to start considering API versions. Yowza.
+        # principal_type is passed through to here anticipating that change.
+        parameters = azure.mgmt.authorization.v2018_01_01_preview.models.RoleAssignmentCreateParameters(principal_id=principal_id,
+                                                                                                        role_definition_id=role_definition_id,
+                                                                                                       )
+        try:
+            self.az_authorization.role_assignments.create(scope, name, parameters)
+        except azure.core.exceptions.ResourceExistsError as exc:
+            caught = laaso.msapicall.Caught(exc)
+            if caught.any_code_matches('RoleAssignmentExists'):
+                return
+            raise
 
     ######################################################################
     # RBAC role definitions
@@ -3217,73 +3635,104 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
           roleName eq '{value}'
           type eq 'BuiltInRole|CustomRole'
         '''
-        az_authorization = self.az_authorization_get(getattr(azrid, 'subscription_id', self.subscription_id))
+        subscription_id = azrid.subscription_id or self.subscription_id
+        az_authorization = self.az_authorization_get(subscription_id)
         return list(az_authorization.role_definitions.list(str(azrid), filter=lfilter))
 
-    def rbac_role_definition_get_by_id(self, definition_id, scope=''):
+    def rbac_role_definition_get_by_id(self, definition_id):
         '''
-        Given a definition_id ('/subscriptions/11111111-1111-1111-1111-111111111111/providers/Microsoft.Authorization/roleDefinitions/11111111-1111-1111-1111-111111111111'),
-        return azure.mgmt.authorization.models.RoleDefinition or None
+        Given a definition_id, return azure.mgmt.authorization.models.RoleDefinition or None
+        Example definition IDs:
+            /providers/Microsoft.Authorization/roleDefinitions/11111111-1111-1111-1111-111111111111
+            /subscriptions/11111111-1111-1111-1111-111111111111/providers/Microsoft.Authorization/roleDefinitions/11111111-1111-1111-1111-111111111111
         '''
-        toks = definition_id.split('/')
-        if len(toks) != 7:
-            raise self.exc_value("invalid definition_id %r" % definition_id)
-        laaso.azresourceid.check_slots(definition_id,
-                                       toks,
-                                       ((0, ''),
-                                        (1, 'subscriptions'),
-                                        (3, 'providers'),
-                                        (4, 'Microsoft.Authorization'),
-                                        (5, 'roleDefinitions')),
-                                       exc_desc='definition_id',
-                                       exc_value=self.exc_value)
-        subscription_id = laaso.util.uuid_normalize(toks[2], key='definition_id.subscription_id', exc_value=self.exc_value)
-        if not scope:
-            return self._rbac_role_definition_get_by_id(subscription_id, definition_id)
-        uniqid = laaso.util.uuid_normalize(toks[6], key='definition_id.uniqid', exc_value=self.exc_value)
-        if isinstance(scope, AzAnyResourceId):
-            scope = str(scope)
-        return self._rbac_role_definition_get_by_id_for_scope(subscription_id, uniqid, scope)
+        # Normalize through role_definition_azrid_from_text to get subscription aliasing
+        definition_azrid = self.role_definition_azrid_from_text(definition_id, exc_value=self.exc_value)
+        return self._rbac_role_definition_get_by_id(definition_azrid)
 
-    def _rbac_role_definition_get_by_id_for_scope(self, subscription_id, uniqid, scope):
+    def _rbac_role_definition_get_by_id(self, definition_azrid):
         '''
         Return azure.mgmt.authorization.models.RoleDefinition
-        uniqid is the UUID from the definition_id
-        scope is the target scope of the definition
+        subscription_id is the subscription_id of the definition_id.
+        Takes definition_azrid rather than definition_id to make mocking simpler and more efficient.
         '''
-        az_authorization = self.az_authorization_get(subscription_id)
-        return az_authorization.role_definitions.get(scope, uniqid)
+        try:
+            return self.az_authorization.role_definitions.get_by_id(str(definition_azrid))
+        except Exception as exc:
+            caught = laaso.msapicall.Caught(exc)
+            if caught.is_missing():
+                return None
+            raise
 
-    def _rbac_role_definition_get_by_id(self, subscription_id, definition_id):
+    @staticmethod
+    def role_definition_azrid_from_text(role_definition_id, exc_value=EXC_VALUE_DEFAULT):
         '''
-        Return azure.mgmt.authorization.models.RoleDefinition
+        Convert str (role_definition_id) to a subclass of AzAnyResourceId
         '''
-        az_authorization = self.az_authorization_get(subscription_id)
-        return az_authorization.role_definitions.get_by_id(definition_id)
+        role_definition_azrid = azresourceid_from_text(role_definition_id,
+                                                       provider_name='Microsoft.Authorization',
+                                                       resource_type='roleDefinitions',
+                                                       exc_desc='role_definition_id',
+                                                       exc_value=exc_value)
+        assert isinstance(role_definition_azrid, (AzProviderResourceId, AzSubscriptionProviderResourceId))
+        return role_definition_azrid
+
+    def rbac_role_definition_logical_name(self, role_definition_id):
+        '''
+        Given role_definition_id as a resource_id, return a human-facing logical string.
+        '''
+        rd = self.rbac_role_definition_get_by_id(role_definition_id)
+        return rd.role_name if rd else role_definition_id
 
     @command.simple
     def rbac_role_definitions_print_json(self):
         '''
         print JSON-serialized rbac_role_definitions_list_for_scope
+        laaso/azure_tool.py rbac_role_definitions_print_json > tests/data/rbac_role_definitions_print.json
         '''
         rds = self.rbac_role_definitions_list_for_scope('/')
         rds_serialized = [rd.serialize(keep_readonly=True) for rd in rds]
-        for rd in rds_serialized:
-            rd['id'] = rd['id'].replace(self.subscription_id, '00000000-0000-0000-0000-000000000000')
-        print(json.dumps(rds_serialized, indent=len(PF)))
+        txt = json.dumps(rds_serialized, indent=len(PF))
+        assert self.subscription_id not in txt
+        print(txt)
 
-    def rbac_role_definition_get_by_name(self, name, role_definitions=None):
+    # key = scope_azrid
+    # value = dict [role_name] -> azure.mgmt.authorization.models.RoleDefinition
+    _cache_rbac_role_definition_bynamedict = laaso.cacher.Cache()
+    laaso.reset_hooks.append(_cache_rbac_role_definition_bynamedict.reset)
+
+    def _rbac_role_definition_bynamedict__cachemiss(self, scope_azrid):
         '''
-        Return the matching azure.mgmt.authorization.models.RoleDefinition.
-        role_definitions is the result of rbac_role_definitions_list_for_scope().
-        If role_definitions is None, use the default scope, which is the whole subscription.
+        Helper for rbac_role_definition_get_by_name.
+        Returns one azure.mgmt.authorization.models.RoleDefinition for role_name in subscription_id.
+        subscription_id may be None or '' (they are treated identically as scope /).
         '''
-        if role_definitions is None:
-            role_definitions = self.rbac_role_definitions_list_for_scope(AzSubscriptionResourceId(self.subscription_id))
-        for rd in role_definitions:
-            if rd.role_name == name:
-                return rd
-        return None
+        rds = self._rbac_role_definitions_list_for_scope(scope_azrid)
+        ret = {rd.role_name : rd for rd in rds}
+        return ret
+
+    def rbac_role_definition_get_by_name(self, role_name, scope):
+        '''
+        Return the matching azure.mgmt.authorization.models.RoleDefinition or None
+        '''
+        if (not scope) or (scope == '/'):
+            scope = AzAnyResourceId()
+        elif not isinstance(scope, AzAnyResourceId):
+            tmp = laaso.util.uuid_normalize(scope, key='scope', exc_value=None)
+            if tmp:
+                scope = AzSubscriptionResourceId(tmp)
+            else:
+                scope = azresourceid_from_text(scope, exc_desc='scope')
+        assert isinstance(scope, AzAnyResourceId)
+        # role definitions are all subscription scoped within a subscription.
+        # flatten it out to share caching.
+        if isinstance(scope, AzSubscriptionResourceId):
+            subscription_id = scope.subscription_id
+        else:
+            subscription_id = ''
+        rd_by_name = self._cache_rbac_role_definition_bynamedict.get(subscription_id,
+                                                                     self._rbac_role_definition_bynamedict__cachemiss, scope)
+        return rd_by_name.get(role_name, None)
 
     ######################################################################
     # keyvault utility ops
@@ -3306,6 +3755,17 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
     ######################################################################
     # keyvault mgmt
 
+    KEYVAULT_AZRID_VALUES = {'provider_name' : 'Microsoft.KeyVault',
+                             'resource_type' : 'vaults',
+                            }
+
+    @classmethod
+    def keyvault_azrid(cls, resource_id):
+        '''
+        Return resource_id in AzResourceId form.
+        '''
+        return azrid_normalize(resource_id, AzResourceId, cls.KEYVAULT_AZRID_VALUES)
+
     @command.printable
     def keyvault_get(self, subscription_id=None, resource_group=None, vault_name=None):
         '''
@@ -3320,15 +3780,16 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
         vault_name = vault_name or self.keyvault_name
         if not vault_name:
             raise ApplicationExit("'vault_name' not specified")
-        return self._keyvault_get(subscription_id, resource_group, vault_name)
+        azrid = AzResourceId.build(subscription_id, resource_group, vault_name, self.KEYVAULT_AZRID_VALUES)
+        return self._keyvault_get(azrid)
 
-    def _keyvault_get(self, subscription_id, resource_group, vault_name):
+    def _keyvault_get(self, azrid):
         '''
         Fetch and return Vault or None
         '''
-        az_keyvault_mgmt = self.az_keyvault_mgmt_get(subscription_id)
+        az_keyvault_mgmt = self.az_keyvault_mgmt_get(azrid.subscription_id)
         try:
-            return az_keyvault_mgmt.vaults.get(resource_group, vault_name)
+            return az_keyvault_mgmt.vaults.get(azrid.resource_group_name, azrid.resource_name)
         except Exception as exc:
             caught = laaso.msapicall.Caught(exc)
             if caught.is_missing():
@@ -3340,11 +3801,25 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
         Given a keyvault id ('/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/infra-rg/providers/Microsoft.KeyVault/vaults/keyvault-name'),
         do a get and return the Vault or None for not-found
         '''
-        if isinstance(vault_id, AzResourceId):
-            azrid = vault_id
-        else:
-            azrid = AzResourceId.from_text(vault_id, provider_name='Microsoft.KeyVault', resource_type='vaults')
-        return self._keyvault_get(azrid.subscription_id, azrid.resource_group_name, azrid.resource_name)
+        azrid = azrid_normalize(vault_id, AzResourceId, self.KEYVAULT_AZRID_VALUES)
+        return self._keyvault_get(azrid)
+
+    def keyvault_create(self, resource_group, resource_name, params):
+        '''
+        Create a keyvault
+        Return azure.mgmt.keyvault.models.Vault
+        '''
+        return self._keyvault_create(resource_group, resource_name, params)
+
+    def _keyvault_create(self, resource_group, resource_name, params):
+        '''
+        Create a keyvault
+        Return azure.mgmt.keyvault.models.Vault
+        '''
+        poller = self.arm_poller(self.az_keyvault_mgmt.vaults)
+        op = self.az_keyvault_mgmt.vaults.begin_create_or_update(resource_group, resource_name, params, polling=poller)
+        op.wait()
+        return op.result()
 
     ######################################################################
     # keyvault certificate issuers
@@ -3385,12 +3860,17 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
 
     ######################################################################
     # keyvault certificates
+    # We do not rely on msapicall.msapiwrap
 
-    def az_certificate_client(self, keyvault_name, client_id=None):
+    def az_certificate_client(self, keyvault_name, client_id=None, allow_login_cred=True):
         '''
         Return azure.keyvault.certificates.CertificateClient for the named vault.
         '''
-        return self._keyvault_content_client_get('certificate', keyvault_name, azure.keyvault.certificates.CertificateClient, client_id=client_id)
+        return self._keyvault_content_client_generate(keyvault_name,
+                                                      azure.keyvault.certificates.CertificateClient,
+                                                      azure.keyvault.certificates._shared.client_base.KeyVaultClientBase, # pylint: disable=protected-access
+                                                      client_id=client_id,
+                                                      allow_login_cred=allow_login_cred)
 
     @command.printable_raw
     def keyvault_certificate_versions_get(self, cert_name=None, keyvault_name=None, client_id=None):
@@ -3412,7 +3892,7 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
         '''
         Internals of keyvault_certificate_versions_get
         '''
-        cid_list = self._msi_clientids_get(client_id=client_id)
+        cid_list = self.client_ids_get(client_id=client_id)
         for cid in cid_list:
             try:
                 client = self.az_certificate_client(keyvault_name, client_id=cid)
@@ -3422,6 +3902,7 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
             except Exception as exc:
                 caught = laaso.msapicall.Caught(exc)
                 self.logger.warning("%s failed with client_id=%r is_missing=%s: %r", self.mth(), cid, caught.is_missing(), exc)
+                raise
         return list()
 
     @command.printable_raw
@@ -3448,7 +3929,7 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
         Get the newest certificate.
         Return azure.keyvault.certificates.KeyVaultCertificate or None.
         '''
-        cid_list = self._msi_clientids_get(client_id=client_id)
+        cid_list = self.client_ids_get(client_id=client_id)
         res = None
         for cid in cid_list:
             try:
@@ -3502,11 +3983,16 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
     ######################################################################
     # keyvault secrets
 
-    def az_secrets_client(self, keyvault_name, client_id=None):
+    def az_secrets_client(self, keyvault_name, client_id=None, allow_login_cred=True):
         '''
         Return azure.keyvault.secrets.SecretClient for the named vault.
+        https://docs.microsoft.com/en-us/python/api/azure-keyvault-secrets/azure.keyvault.secrets.secretclient?view=azure-python
         '''
-        return self._keyvault_content_client_get('secret', keyvault_name, azure.keyvault.secrets.SecretClient, client_id=client_id)
+        return self._keyvault_content_client_generate(keyvault_name,
+                                                      azure.keyvault.secrets.SecretClient,
+                                                      azure.keyvault.secrets._shared.client_base.KeyVaultClientBase, # pylint: disable=protected-access
+                                                      client_id=client_id,
+                                                      allow_login_cred=allow_login_cred)
 
     @command.printable_raw
     def keyvault_secret_get(self, secret_name=None, keyvault_name=None, client_id=None):
@@ -3532,11 +4018,7 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
         Return azure.keyvault.secrets.KeyVaultSecret or None.
         '''
         ret = None
-        cid_list = self._msi_clientids_get(client_id=client_id)
-        assert isinstance(cid_list, list)
-        if not all(isinstance(x, (str, type(None))) for x in cid_list):
-            self.logger.error("invalid cid_list from client_id=%r:\n%s", client_id, laaso.util.indent_pformat(cid_list))
-            raise TypeError("invalid cid_list")
+        cid_list = self.client_ids_get(client_id=client_id)
         for cid in cid_list:
             try:
                 client = self.az_secrets_client(keyvault_name, client_id=cid)
@@ -3560,105 +4042,58 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
             return secret.value
         return None
 
-    @command.printable_raw
-    def keyvault_secret_get_direct(self, keyvault_name=None, secret_name=None, fail_exit=True):
+    def keyvault_secret_set(self, keyvault_name, secret_name, secret_value, client_id=None, **kwargs):
         '''
-        Bypass the SDK to get a keyvault secret
+        Set the named secret in the named keyvault.
+        '''
+        client = self.az_secrets_client(keyvault_name, client_id=client_id)
+        client.set_secret(secret_name, secret_value, enabled=True, **kwargs)
+
+    @command.printable
+    def keyvault_secret_list_names(self, keyvault_name=None, client_id=None, enabled_only=True):
+        '''
+        Return a list of secret names in the given vault
         '''
         keyvault_name = keyvault_name or self.keyvault_name
         if not keyvault_name:
-            self.logger.error("'keyvault_name' not specified")
-            raise ApplicationExit(1)
-        secret_name = secret_name or self.secret_name
-        if not secret_name:
-            self.logger.error("'secret_name' not specified")
-            raise ApplicationExit(1)
-        audience = self.cloud.suffixes.keyvault_dns[1:]
-        at = self.metadata_access_token_get(audience=audience, fail_exit=fail_exit)
-        if not fail_exit:
-            if not at:
-                return None
-            if at.get('error', ''):
-                return None
-        headers = {'Authorization' : "%s %s" % (at['token_type'], at['access_token']),
-                  }
-        api_version = REST_API_VERSIONS['keyvault']
-        tried_api_versions = set()
-        res = None
-        while True:
-            tried_api_versions.add(api_version)
-            keyvault_dns = keyvault_name + self.cloud.suffixes.keyvault_dns
-            url = r'https://{vault_dns}/secrets/{secret_name}?api-version={api_version}'.format(vault_dns=keyvault_dns,
-                                                                                                secret_name=secret_name,
-                                                                                                api_version=api_version)
-            resp = msapicall(self.logger, requests.get, url=url, headers=headers)
-            if resp.status_code != http.client.OK:
-                rt = os.fsdecode(resp.content)
-                tmp = r'Consider using the latest supported version \(([^\)]+)\)'
-                m = re.search(tmp, rt)
-                if not (m and m.group(1)):
-                    return self._requests_get_fail(resp, fail_exit=fail_exit)
-                api_version = m.group(1)
-                if m in tried_api_versions:
-                    return self._requests_get_fail(resp, fail_exit=fail_exit)
-                continue
-            res = json.loads(resp.content)
-            if not res:
-                return self._requests_get_fail(resp, fail_exit=fail_exit, msg='no resp.content')
-            break
-        secret = res.get('value', '')
-        if secret:
-            kn = keyvault_name + '/' + secret_name
-            output_redact(kn, secret)
-            return secret
-        return self._requests_get_fail(resp, fail_exit=True, msg='no value for secret')
+            raise self.exc_value("'keyvault_name' not specified")
+        return self._keyvault_secret_list(keyvault_name, client_id, enabled_only=enabled_only)
 
-    @command.printable_raw
-    def keyvault_secret_get_any(self, keyvault_name=None, secret_name=None):
+    def _keyvault_secret_list(self, keyvault_name, client_id, enabled_only=True):
         '''
-        Try to fetch the named secret. Prefer using MSI creds.
-        Returns the secret as a str, or None if the secret cannot be fetched.
+        Return a list of secret names in the given vault.
+        Returns None or raises if the vault cannot be listed.
         '''
-        secret_name = secret_name or self.secret_name
-        secret = self.keyvault_secret_get_direct(keyvault_name=keyvault_name, secret_name=secret_name, fail_exit=False)
-        if secret is not None:
-            return secret
-        ks = self.keyvault_secret_get(keyvault_name=keyvault_name, secret_name=secret_name)
-        if ks:
-            return ks.value
+        cid_list = self.client_ids_get(client_id=client_id)
+        for cid in cid_list:
+            client = self.az_secrets_client(keyvault_name, client_id=cid)
+            try:
+                res = list(client.list_properties_of_secrets())
+            except Exception as exc:
+                if 'ManagedIdentityCredential authentication unavailable' in str(exc):
+                    continue
+                raise
+            return [x.name for x in res if (not enabled_only) or x.enabled]
         return None
 
     ######################################################################
     # keyvault contents (type-independent)
 
-    def _keyvault_content_client_get(self, content_type, keyvault_name, client_class, client_id=None):
-        '''
-        Return an object of type client_class for the named vault.
-        This client is cached. The cache is populated iff necessary.
-        The cache is thread-safe, but use of the client is not.
-        '''
-        assert content_type in self._keyvault_clients
-        with self._az_client_gen_lock:
-            cdict = self._keyvault_clients.setdefault(content_type, dict())
-            if keyvault_name not in cdict:
-                cdict[keyvault_name] = self._keyvault_content_client_generate(keyvault_name, client_class, client_id=client_id)
-            ret = cdict[keyvault_name]
-            assert isinstance(ret, client_class)
-            return ret
-
-    def _keyvault_content_client_generate(self, keyvault_name, client_class, client_id=None):
+    def _keyvault_content_client_generate(self, keyvault_name, client_class, client_parent_class, client_id=None, allow_login_cred=True):
         '''
         Create an return an object of type client_class for the named vault.
         client_class is something like azure.keyvault.secrets.SecretClient.
         '''
-        credential = self.azure_credential_generate(client_id=client_id)
+        credential = self.azure_credential_generate(client_id=client_id, allow_login_cred=allow_login_cred)
         keyvault_url = "https://%s%s/" % (keyvault_name, self.cloud.suffixes.keyvault_dns)
-        return client_class(vault_url=keyvault_url, credential=credential)
+        cli = client_class(vault_url=keyvault_url, credential=credential)
+        laaso.msapicall.wrap_child_only_methods(cli, client_parent_class, self.logger)
+        return cli
 
     ######################################################################
     # pubkey
 
-    @command.printable
+    @command.printable_raw
     def user_pubkey_get(self, keyvault_name=None, keyvault_client_id=None, username=None):
         '''
         Return the public key for the given user. This is retrieved
@@ -3934,19 +4369,6 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
         return self._requests_get_fail(resp, fail_exit=fail_exit)
 
     @command.printable
-    def metadata_access_token_get(self, audience=r'management.azure.com%2F', fail_exit=False):
-        '''
-        Fetch and return the access token from the metadata service
-        '''
-        parameters = {'resource' : r'https%3A%2F%2F' + audience}
-        content = self._metadata_request_any_version('identity/oauth2/token', parameters=parameters, fail_exit=fail_exit, rformat=None)
-        if content is None:
-            if fail_exit:
-                raise ApplicationExit("%s from %s audience=%r response content is None" % (self.mth(), getframe(1), audience))
-            return None
-        return json.loads(content)
-
-    @command.printable
     def metadata_instance_get(self):
         '''
         Fetch and return instance info from the metadata service.
@@ -3954,21 +4376,131 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
         return self._metadata_request_any_version('instance', fail_exit=True, rformat='json')
 
     @command.printable
+    def metadata_instance_compute_get(self):
+        '''
+        Fetch and return instance info from the metadata service.
+        '''
+        return self._metadata_request_any_version('instance/compute', fail_exit=True, rformat='json')
+
+    @command.printable
+    def metadata_subscription_id_get(self):
+        '''
+        Fetch and return the subscription_id for the local VM
+        '''
+        ret = self.metadata_instance_compute_get()['subscriptionId']
+        return laaso.util.uuid_normalize(ret)
+
+    @command.printable
     def metadata_resource_group_get(self):
         '''
         Fetch and return the resource_group name for the local VM
         '''
-        return self._metadata_request_any_version('instance/compute', fail_exit=True, rformat='json')['resourceGroupName']
+        return self.metadata_instance_compute_get()['resourceGroupName']
 
     @command.printable
-    def local_vm_name_get(self):
+    def metadata_location_get(self):
+        '''
+        Fetch and return the location for the local VM
+        '''
+        return self.metadata_instance_compute_get()['location']
+
+    @command.printable
+    def metadata_tags_get(self):
+        '''
+        Fetch and return the resource_group name for the local VM
+        '''
+        tags_list = self.metadata_instance_compute_get()['tagsList']
+        # tagsList is a list of dicts, where each dict looks like {'name': 'purpose', 'value': 'devel'}
+        tags = {x['name'] : x['value'] for x in tags_list}
+        return tags
+
+    @command.printable
+    def metadata_name_get(self):
         '''
         Return the name of the local VM
         '''
-        return self._metadata_request_any_version('instance/compute', fail_exit=True, rformat='json')['name']
+        return self.metadata_instance_compute_get()['name']
+
+    @command.printable
+    def metadata_vm_azrid_get(self):
+        '''
+        Return AzResourceId for this VM
+        '''
+        instance_data = self.metadata_instance_compute_get()
+        return AzResourceId(instance_data['subscriptionId'],
+                            instance_data['resourceGroupName'],
+                            'Microsoft.Compute',
+                            'virtualMachines',
+                            instance_data['name'])
+
+    # https://www.dmtf.org/sites/default/files/standards/documents/DSP0243_1.0.0.pdf
+    METADATA_OVF_ENV = '/var/lib/waagent/ovf-env.xml'
+
+    @classmethod
+    def metadata_custom_data_get(cls):
+        '''
+        Return the custom data for this VM in bytes form.
+        '''
+        # At this time, the ability of the metadata service to return
+        # custom data is disabled; it always claims there is no data.
+        # The custom data is available in a file in an iso9660
+        # filesystem accessible via /dev/dvd. Getting it that way
+        # is slow and painful, because it involves mounting the device.
+        # To keep this code out of dealing with these device mounts
+        # (which requires running as superuser), we instead rely
+        # on the waagent writing the custom data to a well-known
+        # file on the local disk. Unfortunately, we get VMs with
+        # older waagent versions that do not write /var/lib/waagent/CustomData,
+        # so we must read and parse /var/lib/waagent/ovf-env.xml.
+        with open(cls.METADATA_OVF_ENV, 'r') as f:
+            xmltxt = f.read()
+        et_root = ElementTree.fromstring(xmltxt)
+        nsdict = {x[1][0] : x[1][1] for x in ElementTree.iterparse(io.StringIO(xmltxt), events=['start-ns'])}
+        elem = et_root.find('.//ns1:CustomData', nsdict)
+        elem_text = getattr(elem, 'text', b'') # bool(elem) is False. No kidding.
+        if not elem_text:
+            return b''
+        ret = base64.decodebytes(bytes(elem_text, encoding='utf-8'))
+        return ret
 
     ######################################################################
     # Managed identities (MSI) (UAMI)
+
+    UAMI_AZRID_VALUES = {'provider_name' : 'Microsoft.ManagedIdentity',
+                         'resource_type' : 'userAssignedIdentities',
+                        }
+
+    @classmethod
+    def user_assigned_identity_azrid(cls, resource_id):
+        '''
+        Return resource_id in AzResourceId form.
+        '''
+        return azrid_normalize(resource_id, AzResourceId, cls.UAMI_AZRID_VALUES)
+
+    @classmethod
+    def is_uami_resource_id(cls, resource_id):
+        '''
+        Return whether resource_id is a user assigned managed identity
+        '''
+        azrid = azrid_normalize_or_none(resource_id, AzResourceId, cls.UAMI_AZRID_VALUES)
+        return azrid and azrid_is(azrid, AzResourceId, **cls.UAMI_AZRID_VALUES)
+
+    @classmethod
+    def user_assigned_identity_resource_type(cls):
+        '''
+        Return the resource type string - eg x.type where x is the SDK resource obj.
+        '''
+        v = cls.UAMI_AZRID_VALUES
+        return f"{v['provider_name']}/{v['resource_type']}"
+
+    @classmethod
+    def user_assigned_identity_obj_normalize(cls, obj):
+        '''
+        The ManagedIdentity RP returns strings with
+        nonstandard case. Normalize these strings to
+        a consistent form.
+        '''
+        return cls.sdk_resource_obj_normalize(obj, cls.UAMI_AZRID_VALUES, cls.user_assigned_identity_resource_type())
 
     @command.printable
     def user_assigned_identity_get(self, subscription_id=None, resource_group=None, name=None):
@@ -3984,7 +4516,9 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
         resource_group = resource_group or self.resource_group or self.keyvault_resource_group
         if not resource_group:
             raise ApplicationExit("'resource_group' not specified")
-        return self._user_assigned_identity_get(subscription_id, resource_group, name)
+        ret = self._user_assigned_identity_get(subscription_id, resource_group, name)
+        ret = self.user_assigned_identity_obj_normalize(ret)
+        return ret
 
     def _user_assigned_identity_get(self, subscription_id, resource_group, name):
         '''
@@ -4004,26 +4538,53 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
         Return azure.mgmt.msi.models.Identity or None
         The full resource id will embed the subscription id -- use that instead of self.subscription_id
         '''
-        if isinstance(msi_id, AzResourceId):
-            azrid = msi_id
-        else:
-            azrid = AzResourceId.from_text(msi_id, subscription_id=None, provider_name='Microsoft.ManagedIdentity', resource_type='userAssignedIdentities')
-        return self._user_assigned_identity_get(azrid.subscription_id, azrid.resource_group_name, azrid.resource_name)
+        azrid = self.user_assigned_identity_azrid(msi_id)
+        ret = self._user_assigned_identity_get(azrid.subscription_id, azrid.resource_group_name, azrid.resource_name)
+        ret = self.user_assigned_identity_obj_normalize(ret)
+        return ret
 
-    @command.simple
-    def user_assigned_identity_print_json(self):
+    def user_assigned_identity_create_or_update(self, resource_group, resource_name, location, tags):
         '''
-        print JSON-serialized user_assigned_identity_get with owner tag anonymized
+        Create or update UAMI. Return azure.mgmt.msi.models.Identity.
         '''
-        resource = self.user_assigned_identity_get()
-        resource.tags['owner'] = 'mockuser'
-        print(json.dumps(resource.serialize(keep_readonly=True), indent=len(PF)))
+        return self._user_assigned_identity_create_or_update(resource_group, resource_name, location, tags)
+
+    def _user_assigned_identity_create_or_update(self, resource_group, resource_name, location, tags):
+        '''
+        Create or update UAMI. Return azure.mgmt.msi.models.Identity.
+        '''
+        poller = self.arm_poller(self.az_msi.user_assigned_identities)
+        ret = self.az_msi.user_assigned_identities.create_or_update(resource_group, resource_name,
+                                                                    location=location,
+                                                                    tags=tags,
+                                                                    polling=poller)
+        ret = self.user_assigned_identity_obj_normalize(ret)
+        return ret
 
     ######################################################################
-    # Active directory (AAD)
+    # Active directory (AAD) user, service_principal
 
     _cache_ad_service_principal_by_object_id = CacheIndexer()
     laaso.reset_hooks.append(_cache_ad_service_principal_by_object_id.reset)
+
+    def ad_service_principal_wait(self, object_id, max_wait_secs=300, sleep_secs=0.5):
+        '''
+        Wait for object_id to show up as an AAD service principal.
+        This is useful because after creating a UAMI, it is registered
+        with AAD, but that registration can take some time.
+        Bypass the cache to avoid caching does-not-exist.
+        Return azure.graphrbac.models.ServicePrincipal or None.
+        '''
+        t = time.monotonic()
+        deadline = t + max_wait_secs
+        while t <= deadline:
+            sp = self._ad_service_principal_get_by_object_id(object_id)
+            if sp:
+                return sp
+            if t < deadline:
+                time.sleep(sleep_secs)
+            t = time.monotonic()
+        return None
 
     def ad_service_principal_get_by_object_id(self, object_id):
         '''
@@ -4038,13 +4599,11 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
         '''
         try:
             return self.az_graphrbac_mgmt.service_principals.get(object_id)
-        except azure.graphrbac.models.GraphErrorException as exc:
-            if exc.error.code == 'Request_ResourceNotFound':
-                return None
-            raise
         except Exception as exc:
             caught = laaso.msapicall.Caught(exc)
             if caught.is_missing():
+                return None
+            if caught.any_code_matches('PrincipalNotFound'):
                 return None
             raise
 
@@ -4053,7 +4612,7 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
 
     def ad_user_get(self, upn_or_object_id):
         '''
-        Return User or None
+        Return azure.graphrbac.models.User or None
         Reminder: when doing a username, include @microsoft.com (or whatever)
         '''
         return self._cache_ad_user_by_upn_or_object_id.get(self.tenant_id, upn_or_object_id,
@@ -4061,7 +4620,7 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
 
     def _ad_user_get(self, upn_or_object_id):
         '''
-        Return User or None
+        Return azure.graphrbac.models.User or None
         '''
         try:
             return self.az_graphrbac_mgmt.users.get(upn_or_object_id)
@@ -4074,6 +4633,45 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
             if caught.is_missing():
                 return None
             raise
+
+    def ad_get_objects_by_object_ids(self, object_ids, types=None, subscription_id=None):
+        '''
+        object_ids is a list of UUID-as-str.
+        Returns a list of the appropriate SDK objects (eg User, ServicePrincipal).
+        Unrecognized IDs are omitted from the returned list.
+        The ordering in the return list does not correspond to the ordering of object_ids.
+        If types is specified, it is a list of strings such as 'Application'.
+        These semantics correspond to the underlying REST operation.
+        See https://docs.microsoft.com/en-us/python/api/azure-graphrbac/azure.graphrbac.operations.objectsoperations?view=azure-python
+        '''
+        subscription_id = subscription_id or self.subscription_id
+        return self._ad_get_objects_by_object_ids(subscription_id, object_ids, types)
+
+    def _ad_get_objects_by_object_ids(self, subscription_id, object_ids, types):
+        '''
+        object_ids is a list of UUID-as-str.
+        Returns a list of the appropriate SDK objects (eg User, ServicePrincipal).
+        Unrecognized IDs are omitted from the returned list.
+        The ordering in the return list does not correspond to the ordering of object_ids.
+        types is a list of strings such as 'Application'. If not specified, looks at all types.
+        These semantics correspond to the underlying REST operation.
+        See https://docs.microsoft.com/en-us/python/api/azure-graphrbac/azure.graphrbac.operations.objectsoperations?view=azure-python
+        '''
+        az_graphrbac_mgmt = self.az_graphrbac_mgmt_get(subscription_id)
+        param = {'object_ids' : object_ids}
+        if types:
+            param['types'] = types
+        return list(az_graphrbac_mgmt.objects.get_objects_by_object_ids(param))
+
+    def ad_get_object_by_object_id(self, object_id, types=None, subscription_id=None):
+        '''
+        Wrapper for ad_get_objects_by_object_ids that handles a single object_id.
+        Returns the object or None for not-found.
+        '''
+        res = self.ad_get_objects_by_object_ids([object_id], types=types, subscription_id=subscription_id)
+        if res:
+            return res[0]
+        return None
 
     ######################################################################
     # Kusto support
@@ -4163,7 +4761,9 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
         '''
         Getter: self.az_graphrbac_mgmt, generated on the first call and then cached
         '''
-        return self._az_client_gen_property('_az_graphrbac_mgmt', GraphRbacManagementClient)
+        # TODO (9042401) Figure out a strategy for handling AAD access
+        client_id = [None] # Force login creds only because chained creds do not seem to work with GraphRbacManagementClient
+        return self._az_client_gen_property('_az_graphrbac_mgmt', GraphRbacManagementClient, client_id=client_id)
 
     @property
     def az_keyvault_mgmt(self):
@@ -4215,6 +4815,13 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
         '''
         return self._az_client_gen_property('_az_storage', StorageManagementClient)
 
+    @property
+    def az_subscription(self):
+        '''
+        Getter: self.az_subscription, generated on the first call and then cached
+        '''
+        return self._az_client_gen_property('_az_subscription', SubscriptionClient)
+
     ######################################################################
     # SDK client get operations
 
@@ -4235,6 +4842,18 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
         if subscription_id == self.subscription_id:
             return self.az_compute
         return self._az_client_gen_do('compute', ComputeManagementClient, subscription_id=subscription_id)
+
+    def az_graphrbac_mgmt_get(self, subscription_id, client_id=None):
+        '''
+        Get a GraphRbacManagementClient for the given subscription.
+        '''
+        subscription_id = laaso.subscription_mapper.effective(subscription_id)
+        if subscription_id == self.subscription_id:
+            return self.az_graphrbac_mgmt
+        # TODO (9042401) Figure out a strategy for handling AAD access
+        if not client_id:
+            client_id = [None] # Force login creds only because chained creds do not seem to work with GraphRbacManagementClient
+        return self._az_client_gen_do('graphrbac_mgmt', GraphRbacManagementClient, subscription_id=subscription_id, client_id=client_id)
 
     def az_keyvault_mgmt_get(self, subscription_id):
         '''
@@ -4264,40 +4883,54 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
             return self.az_msi
         return self._az_client_gen_do('msi', ManagedServiceIdentityClient, subscription_id=subscription_id)
 
+    def az_network_get(self, subscription_id):
+        '''
+        Get a NetworkManagementClient given a subscription_id and client id
+        if client_id is not specified, try using default azure creds (client_id: default)
+        '''
+        subscription_id = laaso.subscription_mapper.effective(subscription_id)
+        if subscription_id == self.subscription_id:
+            return self.az_network
+        return self._az_client_gen_do('network', NetworkManagementClient, subscription_id=subscription_id)
+
+    def az_resource_generate(self, subscription_id, client_id=None):
+        '''
+        Get a ResourceManagementClient for the given subscription.
+        Always generates a new client, bypassing any caching.
+        '''
+        subscription_id = laaso.subscription_mapper.effective(subscription_id)
+        return self._az_client_gen_do('resource', ResourceManagementClient, subscription_id=subscription_id, client_id=client_id)
+
     def az_resource_get(self, subscription_id):
         '''
         Get a ResourceManagementClient for the given subscription.
         '''
-        subscription_id = laaso.subscription_mapper.effective(subscription_id)
-        if subscription_id == self.subscription_id:
-            return self.az_resource
-        return self._az_client_gen_do('resource', ResourceManagementClient, subscription_id=subscription_id)
+        return self.az_resource_generate(subscription_id)
 
     ######################################################################
     # SDK client object generation
 
-    def _az_client_gen_do(self, name, client_class, subscription_id=None):
+    def _az_client_gen_do(self, name, client_class, subscription_id=None, client_id=None):
         '''
         Factory for Azure SDK client of type client_class.
         '''
-        ret = self._az_client_gen_do_cli(name, client_class, subscription_id=subscription_id)
+        ret = self._az_client_gen_do_cli(name, client_class, subscription_id=subscription_id, client_id=client_id)
         # Generate the wrappers here directly rather than wrapping _az_client_gen_do_cli()
         # or get_client_from_cli_profile() with msapicall() to avoid
         # retrying construction errors and to specialize
         # auth error handling in _az_client_gen_do_cli().
         return msapiwrap(self.logger, ret)
 
-    def _az_client_gen_do_cli(self, name, client_class, subscription_id=None, max_tries=5):
+    def _az_client_gen_do_cli(self, name, client_class, subscription_id=None, client_id=None, max_tries=5):
         '''
         Factory for Azure SDK client of type client_class using CLI creds.
         Do not call this directly; call _az_client_gen_do().
         '''
         assert max_tries > 0
         subscription_id = subscription_id or self.subscription_id
-        config_kwargs = {'subscription_id' : subscription_id}
         for try_num in range(1, max_tries+1):
             try:
-                return self._get_client_from_cli_profile(client_class, **config_kwargs)
+                return self._get_client_from_cli_profile(client_class, subscription_id=subscription_id, client_id=client_id)
             except knack.util.CLIError as exc:
                 if (self.logger.level <= logging.DEBUG) or self.debug:
                     st = '\n' + traceback.format_exc().rstrip() + '\n' + repr(exc)
@@ -4309,7 +4942,7 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
                 else:
                     log_level = logging.DEBUG
                     wr = 'will retry'
-                self.logger.log(log_level, "cannot generate %s (%s)%s", name, wr, st)
+                self.logger.log(log_level, "%s cannot generate %s (%s)%s", self.mth(), name, wr, st)
                 if try_num < max_tries:
                     # When several threads start up at the same time, we sometimes
                     # see transient failures when they try to auth simultaneously.
@@ -4381,8 +5014,15 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
                       'credential' : credential,
                       'credentials' : credential,
                       'subscription_id' : subscription_id,
-                      'tenant_id' : tenant_id,
                      }
+
+        if tenant_id:
+            parameters['tenant_id'] = tenant_id
+
+        for kls, vers in API_VERSIONS_DEFAULT:
+            if issubclass(client_class, kls):
+                parameters['api_version'] = vers
+                break
 
         parameters.update(kwargs)
 
@@ -4391,7 +5031,7 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
             parameters['adla_job_dns_suffix'] = self.cloud.suffixes.azure_datalake_analytics_catalog_and_job_endpoint
         elif ('base_url' in args) and (not parameters['base_url']):
             parameters['base_url'] = self.cloud.endpoints.resource_manager
-        if ('tenant_id' in args) and ('tenant_id' not in parameters):
+        if ('tenant_id' in args) and ('tenant_id' not in parameters) and self.tenant_id:
             parameters['tenant_id'] = self.tenant_id
 
         ret = self._instantiate_client(client_class, **parameters)
@@ -4418,7 +5058,7 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
         use_kwargs = {k : v for k, v in kwargs.items() if k in cli_args_all}
         return target_class(*use_args, **use_kwargs)
 
-    def _az_client_gen_property(self, name, client_class):
+    def _az_client_gen_property(self, name, client_class, **kwargs):
         '''
         Generate self.<name> as self._az_client_gen_do(...).
         This sits on top of _az_client_gen_do and caches the result
@@ -4429,14 +5069,29 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
         with self._az_client_gen_lock:
             ret = getattr(self, name, None)
             if ret is None:
-                ret = self._az_client_gen_do(name, client_class)
+                ret = self._az_client_gen_do(name, client_class, **kwargs)
                 setattr(self, name, ret)
             return ret
 
     ######################################################################
     # credentials
 
-    def azure_credential_generate(self, client_id=None, caller_tag=None):
+    def _credential_from_spec(self, spec, caller_tag):
+        '''
+        spec describes a credential
+          AzCred.LOGIN: login credential
+          AzCred.SYSTEM_ASSIGNED: system-assigned identity for this VM
+          UUID-as-string: UAMI for this ID
+        '''
+        if spec == AzCred.LOGIN:
+            credential = laaso.msapicall.AzLoginCredential(self.logger)
+        elif spec == AzCred.SYSTEM_ASSIGNED:
+            credential = azure.identity.ManagedIdentityCredential()
+        else:
+            credential = self._managed_identity_credential_generate(spec, caller_tag)
+        return msapiwrap(self.logger, credential)
+
+    def azure_credential_generate(self, client_id=None, caller_tag=None, allow_login_cred=True):
         '''
         Generate and return an appropriate credential object.
         If client_id is specified, use a ManagedIdentityCredential.
@@ -4444,27 +5099,57 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
         variant of DefaultAzureCredential that only considers cached
         az login credentials but does retries when fetching them.
 
-        If a client_id is explicitly passed or if self.require_msi is true,
+        If a client_id is explicitly passed or pinned,
         then uami client_id is used to acquire credential obj of type ManagedIdentityCredential().
         '''
         caller_tag = caller_tag or getframe(1)
-        if self.require_msi and (not client_id):
-            client_id = self.managed_identity_client_id
-            assert client_id
-        if client_id:
-            cid_mapped = laaso.identity.client_id_from_uami_str(client_id, self, resolve_using_azmgr=False)
-            if not cid_mapped:
-                raise ValueError("%s cannot process client_id=%r caller_tag=%s" % (self.mth(), client_id, caller_tag))
-            try:
-                credential = azure.identity.ManagedIdentityCredential(client_id=cid_mapped)
-                self.logger.debug("acquired ManagedIdentityCredential for client_id=%r cid_mapped=%r caller_tag=%s self=%s", client_id, cid_mapped, caller_tag, hex(id(self)))
-                return msapiwrap(self.logger, credential)
-            except Exception as exc:
-                self.logger.error("failed to get managed credentials for identity %r caller_tag=%s: %r", cid_mapped, caller_tag, exc)
-                raise
 
-        credential = laaso.msapicall.AzLoginCredential(self.logger)
-        self.logger.debug("acquired default azure credentials for caller_tag=%s", caller_tag)
+        append_login_credential = not self.require_msi
+
+        client_id = client_id or self._pin_client_id or [AzCred.LOGIN]
+        credentials = list()
+        seen = list() # do not use a set to maintain ordering for debugging
+        if client_id:
+            if isinstance(client_id, (list, tuple)):
+                for x in client_id:
+                    xdesc = x.value if isinstance(x, AzCred) else x
+                    if not x:
+                        append_login_credential = True
+                    elif xdesc not in seen:
+                        credentials.append(self._credential_from_spec(x, caller_tag))
+                        seen.append(xdesc)
+            else:
+                credentials.append(self._credential_from_spec(client_id, caller_tag))
+                seen.append(client_id)
+        else:
+            append_login_credential = allow_login_cred
+
+        if allow_login_cred and append_login_credential and (AzCred.LOGIN not in seen):
+            credentials.append(self._credential_from_spec(AzCred.LOGIN, caller_tag))
+            seen.append(None)
+
+        self.logger.debug("%s caller_tag=%s generated %s", self.mth(), caller_tag, seen)
+
+        if not credentials:
+            self.logger.error("%s: no credentials caller_tag=%s client_id %s", self.mth(), caller_tag, client_id)
+            raise ApplicationException(f"{self.mth()}: no credentials caller_tag={caller_tag}")
+        if len(credentials) > 1:
+            return azure.identity._credentials.chained.ChainedTokenCredential(*credentials) # pylint: disable=protected-access
+        return credentials[0]
+
+    def _managed_identity_credential_generate(self, client_id, caller_tag):
+        '''
+        Generate a single azure.identity.ManagedIdentityCredential for the given client_id.
+        '''
+        cid_mapped = laaso.identity.client_id_from_uami_str(client_id, self, resolve_using_azmgr=False)
+        if not cid_mapped:
+            raise ValueError("%s cannot process client_id=%r caller_tag=%s" % (self.mth(), client_id, caller_tag))
+        try:
+            credential = azure.identity.ManagedIdentityCredential(client_id=cid_mapped)
+        except Exception as exc:
+            self.logger.warning("cannot get managed credentials for identity %r caller_tag=%s: %r", cid_mapped, caller_tag, exc)
+            raise
+        self.logger.debug("acquired ManagedIdentityCredential for client_id=%r cid_mapped=%r caller_tag=%s self=%s", client_id, cid_mapped, caller_tag, hex(id(self)))
         return msapiwrap(self.logger, credential)
 
     ######################################################################
@@ -4506,6 +5191,17 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
 
     ######################################################################
     # managed image operations
+
+    MANAGED_IMAGE_AZRID_VALUES = {'provider_name' : 'Microsoft.Compute',
+                                  'resource_type' : 'images',
+                                 }
+
+    @classmethod
+    def managed_image_azrid(cls, resource_id):
+        '''
+        Return resource_id in AzResourceId form.
+        '''
+        return azrid_normalize(resource_id, AzResourceId, cls.MANAGED_IMAGE_AZRID_VALUES)
 
     @command.printable
     def managed_image_get(self, subscription_id=None, vm_image_resource_group=None, vm_image_name=None):
@@ -4565,7 +5261,7 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
     def managed_image_get_by_id(self, image_id):
         '''
         Given a managed image ID as an ARM resource ID or an abbreviated id, return azure.mgmt.compute.models.Image or None
-        Example: /subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/username-image-build-b-22/providers/Microsoft.Compute/images/username-cbld-devel
+        Example: /subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/someuser-image-build-b-22/providers/Microsoft.Compute/images/someuser-cbld-devel
         This is only for managed images.
         '''
         parsed = self.managed_image_id_parse(image_id)
@@ -5121,7 +5817,7 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
         done = False
         while not done:
             done = True
-            for d in (laaso.scfg.image_shortcuts, self._image_map_dict):
+            for d in (laaso.scfg.get('image_shortcuts', {}), self._image_map_dict):
                 try:
                     cur = d[cur]
                     done = False
@@ -5257,6 +5953,117 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
         return {'id' : image_id_mapped}
 
     ######################################################################
+    # dedicated-host group and dedicated host wrappers
+    #
+
+    def dedicated_host_group_create(self, dh_rg, dh_group_name, dh_group_params):
+        '''
+        create a dedicated host group and return azure.compute.models.DedicatedHostGroup obj
+        '''
+        return self._dedicated_host_group_create(self.subscription_id, dh_rg, dh_group_name, dh_group_params)
+
+    def _dedicated_host_group_create(self, subscription_id, dh_rg, dh_group_name, dh_group_params):
+        '''
+        wrapper around DedicatedHostGroupsOperations create_or_update
+        '''
+        try:
+            az_compute = self.az_compute_get(subscription_id)
+            res = az_compute.dedicated_host_groups.begin_create_or_update(dh_rg, dh_group_name, dh_group_params)
+        except Exception as exc:
+            caught = laaso.msapicall.Caught(exc)
+            if self.debug > 0:
+                if caught.is_missing():
+                    self.logger.debug("cannot create dedicated host group %r in RG %r: %r", dh_group_name, dh_rg, exc)
+                else:
+                    self.logger.debug("cannot create dedicated host group %r in RG %r: %r:\n%s",
+                                      dh_group_name, dh_rg, exc, expand_item_pformat(exc, noexpand_types=AZURE_NOEXPAND_TYPES))
+            raise
+        if self.debug > 0:
+            self.logger.debug("Dedicated Host Group Op Result:\n%s", expand_item_pformat(res))
+        return res
+
+    def dedicated_host_group_get(self, dh_group_name, resource_group=None, subscription_id=None):
+        '''
+        wrapper around _dedicated_host_group_get
+        '''
+        if not dh_group_name:
+            raise ApplicationExit("%s: 'dh_group_name' not specified" % self.mth())
+        resource_group = resource_group or self.resource_group
+        if not resource_group:
+            raise ApplicationExit("'resource_group' not specified")
+        subscription_id = subscription_id or self.subscription_id
+        return self._dedicated_host_group_get(self.subscription_id, resource_group, dh_group_name)
+
+    def _dedicated_host_group_get(self, subscription_id, resource_group, dh_group_name):
+        '''
+        wrapper around DedicatedHostGroupsOperations get
+        '''
+        try:
+            az_compute = self.az_compute_get(subscription_id)
+            return az_compute.dedicated_host_groups.get(resource_group, dh_group_name, expand='instanceView')
+        except Exception as exc:
+            caught = laaso.msapicall.Caught(exc)
+            if caught.is_missing():
+                return None
+            raise
+
+    def dedicated_host_create(self, dh_rg, dh_group_name, dh_name, dh_params):
+        '''
+        creates dedicated host and return azure.mgmt.compute.DedicatedHost object
+        '''
+        return self._dedicated_host_create(self.subscription_id, dh_rg, dh_group_name, dh_name, dh_params)
+
+    def _dedicated_host_create(self, subscription_id, dh_rg, dh_group_name, dh_name, dh_params):
+        '''
+        wrapper around DedicatedHostOperations create_or_update
+        '''
+        try:
+            az_compute = self.az_compute_get(subscription_id)
+            poller = self.arm_poller(az_compute.dedicated_hosts)
+            op = az_compute.dedicated_hosts.begin_create_or_update(dh_rg, dh_group_name, dh_name, dh_params, polling=poller)
+            op.wait()
+            res = op.result()
+        except Exception as exc:
+            caught = laaso.msapicall.Caught(exc)
+            if self.debug > 0:
+                if caught.is_missing():
+                    self.logger.debug("cannot create dedicated host %r in host group %r in RG %r: %r", dh_name, dh_group_name, dh_rg, exc)
+                else:
+                    self.logger.debug("cannot create dedicated host %r in host group %r in RG %r: %r:\n%s",
+                                      dh_name, dh_group_name, dh_rg, exc, expand_item_pformat(exc, noexpand_types=AZURE_NOEXPAND_TYPES))
+            raise
+        if self.debug > 0:
+            self.logger.debug("Dedicated Host Op Result:\n%s", expand_item_pformat(res))
+        return res
+
+    def dedicated_host_get(self, dh_group_name, dh_name, resource_group=None, subscription_id=None):
+        '''
+        wrapper around _dedicated_host_group_create
+        '''
+        if not dh_group_name:
+            raise ApplicationExit("%s: 'dh_group_name' not specified" % self.mth())
+        if not dh_name:
+            raise ApplicationExit("%s: 'dh_name' not specified" % self.mth())
+        resource_group = resource_group or self.resource_group
+        if not resource_group:
+            raise ApplicationExit("'resource_group' not specified")
+        subscription_id = subscription_id or self.subscription_id
+        return self._dedicated_host_get(self.subscription_id, resource_group, dh_group_name, dh_name)
+
+    def _dedicated_host_get(self, subscription_id, resource_group, dh_group_name, dh_name):
+        '''
+        wrapper around DedicatedHostOperations get
+        '''
+        try:
+            az_compute = self.az_compute_get(subscription_id)
+            return az_compute.dedicated_hosts.get(resource_group, dh_group_name, dh_name, expand='instanceView')
+        except Exception as exc:
+            caught = laaso.msapicall.Caught(exc)
+            if caught.is_missing():
+                return None
+            raise
+
+    ######################################################################
     # vm_extension wrappers
 
     def vm_extension_create(self, vm_rg, vm_name, vm_extension_name, vm_ext_parameters):
@@ -5289,10 +6096,9 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
 
     def vm_extension_get(self, vm_name, vm_extension_name, resource_group=None, subscription_id=None):
         '''
-        wrapper around _vm_extension_create which is mocked in managermock
+        Return azure.mgmt.compute.models.VirtualMachineExtension or None
         '''
         if not vm_name:
-            self.logger.error("%s: 'vm_name' not specified", self.mth())
             raise ApplicationExit("%s: 'vm_name' not specified" % self.mth())
         if not resource_group:
             raise ApplicationExit("'resource_group' not specified")
@@ -5301,7 +6107,7 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
 
     def _vm_extension_get(self, subscription_id, vm_rg, vm_name, vm_extension_name):
         '''
-        Wrapper around vm_extension get
+        Return azure.mgmt.compute.models.VirtualMachineExtension or None
         '''
         try:
             az_compute = self.az_compute_get(subscription_id)
@@ -5313,7 +6119,7 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
             raise
 
     ######################################################################
-    # operation wrappers
+    # VM mgmt
 
     def vm_update(self, vm_rg, vm_name, vm_parameters,
                   log_level=logging.INFO,
@@ -5372,7 +6178,75 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
         return res
 
     ######################################################################
+    # VM other
+
+    @staticmethod
+    def vm_custom_data_encode(data, check_len=True, exc_value=EXC_VALUE_DEFAULT):
+        '''
+        Convert data to encoded VM custom data. This accepts data as anything that base64.b64encode
+        accepts. Further, if data is a str, it is assumed ascii and converted
+        to bytes automatically.
+        '''
+        if isinstance(data, str):
+            data = bytes(data, encoding='ascii')
+        ret = str(base64.b64encode(data), encoding='ascii')
+        if check_len and (len(ret) > VM_CUSTOM_DATA_LEN_MAX):
+            raise exc_value(f"custom_data is too long ({len(ret)} > {VM_CUSTOM_DATA_LEN_MAX})")
+        return ret
+
+    @classmethod
+    def vm_custom_data_from_file(cls, filename, exc_value=EXC_VALUE_DEFAULT):
+        '''
+        Read filename, base64 encode it, and return it.
+        '''
+        with open(laaso.paths.repo_root_path(filename), 'rb') as f:
+            data = f.read()
+        ret = cls.vm_custom_data_encode(data, check_len=False, exc_value=exc_value)
+        if len(ret) > VM_CUSTOM_DATA_LEN_MAX:
+            raise exc_value(f"vm_custom_data_filename {filename!r} is too long ({len(ret)} > {VM_CUSTOM_DATA_LEN_MAX})")
+        return ret
+
+    ######################################################################
+    # common SDK iteractions
+
+    @staticmethod
+    def sdk_resource_obj_normalize(obj, resource_values, resource_type_str, docopy=True):
+        '''
+        obj is an arbitrary SDK object that represents a resource.
+        Normalize obj.id and obj.type using the contents of the resource_values dict.
+        '''
+        if obj:
+            if docopy:
+                obj = copy.deepcopy(obj)
+            azrid = azresourceid_or_none_from_text(obj.id, **resource_values)
+            if azrid:
+                obj.id = str(azrid)
+            if obj.type.lower() == resource_type_str.lower():
+                obj.type = resource_type_str
+        return obj
+
+    ######################################################################
+    # bootstrapping helpers
+
+    @classmethod
+    def bootstrap_from_subscription_display_name(cls, subscription_display_name, **kwargs):
+        '''
+        Generate an object for the given subscription_display_name
+        '''
+        managed_identity_client_id = kwargs.get('managed_identity_client_id', None)
+        az_mgr = cls(managed_identity_client_id=managed_identity_client_id,
+                     subscription_id=laaso.util.UUID_ZERO)
+        subscription_id = az_mgr.subscription_id_from_display_name(subscription_display_name)
+        if not subscription_id:
+            raise ApplicationExit(f"cannot find subscription with display_name {subscription_display_name!r}")
+        kwargs.setdefault('subscription_id', subscription_id)
+        return cls(**kwargs)
+
+    ######################################################################
     # main stuff below here
+
+    ARG_USERNAME_ADD = True
+    ARG_USERNAME_HELP = 'user name'
 
     @classmethod
     def main_add_parser_args(cls, ap_parser):
@@ -5434,8 +6308,6 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
                               help='name of storage account')
         at_group.add_argument('--subnet_name', type=str, default='',
                               help='name of subnet in vnet')
-        at_group.add_argument('--username', type=str, default='',
-                              help='user name')
         at_group.add_argument('--vm_boot_diags_storage_account', type=str, default='',
                               help="storage account for VM boot diagnostics")
         at_group.add_argument('--vm_image_name', type=str, default=Manager.VM_IMAGE_NAME_DEFAULT,
@@ -5677,6 +6549,4 @@ class StorageKeyCache():
                         self.busy = False
                         self.cond.notify()
 
-if __name__ == "__main__":
-    Manager.main(sys.argv[1:])
-    raise SystemExit(1)
+Manager.main(__name__)

@@ -14,7 +14,9 @@ Some docs:
 naming rules: https://docs.microsoft.com/en-us/azure/azure-resource-manager/management/resource-name-rules
 '''
 import functools
+import random
 import re
+import string
 import uuid
 
 import laaso._subscriptions
@@ -76,10 +78,6 @@ RE_TAG_KEY_ABS = re.compile(re_abs(RE_TAG_KEY_TXT))
 RE_TAG_VALUE_TXT = r'(.{1,256})'
 RE_TAG_VALUE_ABS = re.compile(re_abs(RE_TAG_VALUE_TXT))
 
-KEY_VAULT_NAME_LEN_MAX = 24
-RE_KEY_VAULT_NAME_TXT = r'[a-zA-Z][a-zA-Z0-9-]{1,22}[a-zA-Z0-9]'
-RE_KEY_VAULT_NAME_ABS = re.compile(re_abs(RE_KEY_VAULT_NAME_TXT))
-
 EXC_DESC_DEFAULT = 'resource_id'
 
 def check_slots(text, toks, expect_slots, exc_desc=EXC_DESC_DEFAULT, exc_value=EXC_VALUE_DEFAULT):
@@ -106,6 +104,24 @@ class AzAnyResourceId():
         # base class, so we go straight there.
         assert issubclass(exc_value, Exception)
         self._exc_value = ValueError
+
+    @property
+    def subscription_id(self):
+        '''
+        Getter for subscription_id.
+        Here in the base class, there is no subscription_id, so always
+        evaluate to None. This is a convenience to callers, who otherwise
+        must do getattr(azrid, 'subscription_id', None) everywhere.
+        subscription_id is, of course, not settable here.
+        '''
+        return None
+
+    @property
+    def subscription_scope(self):
+        '''
+        Getter for the scope of subscription_id.
+        '''
+        return '/'
 
     @staticmethod
     def fmt_vars():
@@ -161,6 +177,28 @@ class AzAnyResourceId():
         expect_slots = ((0, ''), (1, ''))
         check_slots(text, toks, expect_slots, exc_desc=exc_desc, exc_value=exc_value)
         return list()
+
+    def check_values_empty(self, values, exc_value):
+        '''
+        Expect values to be consumed
+        '''
+        if values:
+            raise exc_value(f"{type(self).__name__}: unexpected values content {','.join(values.keys())}")
+
+    def values_sanity(self, values, exc_value=EXC_VALUE_DEFAULT):
+        '''
+        Expect values to be consumed
+        '''
+        for k, v in values.items():
+            if not hasattr(self, k):
+                rr = exc_value or EXC_VALUE_DEFAULT
+                raise rr(f"{type(self).__name__} has no attribute {k!r} to check")
+            o = getattr(self, k)
+            if o.lower() != v.lower():
+                if exc_value:
+                    raise exc_value(f"{k} {o!r} does not match {v!r}")
+                return False
+        return True
 
     @staticmethod
     def values_check(text, ret, exc_value=EXC_VALUE_DEFAULT):
@@ -248,6 +286,157 @@ class AzAnyResourceId():
             raise TypeError("other_id is %s; expected str" % type(other_id))
         return str(self).lower() == other_id.lower()
 
+class AzProviderId(AzAnyResourceId):
+    '''
+    Example:
+        /providers/Microsoft.Authorization
+    '''
+    def __init__(self,
+                 provider_name,
+                 exc_value=EXC_VALUE_DEFAULT,
+                 **kwargs):
+        super().__init__(exc_value=exc_value, **kwargs)
+        self._exc_value = exc_value
+        self.provider_name = provider_name
+        self._exc_value = ValueError
+
+    def fmt_vars(self):
+        '''
+        Return a dict of vars suitable for str.format
+        '''
+        ret = super().fmt_vars()
+        ret['provider_name'] = self.provider_name
+        return ret
+
+    @staticmethod
+    def _repr_args_str():
+        '''
+        Helper for __repr__ that returns the positional args portion
+        '''
+        return 'provider_name={provider_name!r}'
+
+    @staticmethod
+    def _str_fmt():
+        '''
+        Format basis for __str__
+        '''
+        return "/providers/{provider_name}"
+
+    ARGS_FROM_TEXT_TOKENS = 3
+
+    @staticmethod
+    def _args_from_text(text, toks, exc_desc=EXC_DESC_DEFAULT, exc_value=EXC_VALUE_DEFAULT):
+        '''
+        Given toks as an array of strings with length ARGS_FROM_TEXT_TOKENS,
+        parse it and return args for constructing an item of this type.
+        '''
+        expect_slots = ((0, ''), (1, 'providers'))
+        check_slots(text, toks, expect_slots, exc_desc=exc_desc, exc_value=exc_value)
+        return [toks[2]]
+
+    @classmethod
+    def values_check(cls, text, ret, provider_name=None, exc_value=EXC_VALUE_DEFAULT, **kwargs): # pylint: disable=arguments-differ
+        '''
+        ret is a ResourceId object derived from text.
+        Check ret values against kwargs.
+        '''
+        super().values_check(text, ret, exc_value=exc_value, **kwargs)
+        if provider_name and (provider_name.lower() != ret.provider_name.lower()):
+            raise exc_value("unexpected provider_name=%r != %r" % (ret.provider_name, provider_name))
+
+    def values_normalize(self, provider_name=None, **kwargs): # pylint: disable=arguments-differ
+        '''
+        Invoked during from_text() so that the result case-matches caller-provided values
+        '''
+        super().values_normalize(**kwargs)
+        if provider_name:
+            self.provider_name = provider_name
+
+class AzProviderResourceId(AzProviderId):
+    '''
+    Example:
+        /providers/Microsoft.Authorization/roleDefinitions/11111111-1111-1111-1111-111111111111
+    '''
+    def __init__(self,
+                 provider_name,
+                 resource_type,
+                 resource_name,
+                 exc_value=EXC_VALUE_DEFAULT,
+                 **kwargs):
+        super().__init__(provider_name, exc_value=exc_value, **kwargs)
+        self._exc_value = exc_value
+        self.resource_type = resource_type
+        self.resource_name = resource_name
+        self._exc_value = ValueError
+
+    @classmethod
+    def build(cls, resource_name, values, exc_value=EXC_VALUE_DEFAULT, **kwargs):
+        '''
+        Create an object of this type with the given parameters.
+        '''
+        values = dict(values)
+        ret = cls(values.pop('provider_name'),
+                  values.pop('resource_type'),
+                  resource_name,
+                  **kwargs)
+        ret.check_values_empty(values, exc_value=exc_value)
+        return ret
+
+    def fmt_vars(self):
+        '''
+        Return a dict of vars suitable for str.format
+        '''
+        ret = super().fmt_vars()
+        ret['resource_type'] = self.resource_type
+        ret['resource_name'] = self.resource_name
+        return ret
+
+    @classmethod
+    def _repr_args_str(cls):
+        '''
+        Helper for __repr__ that returns the positional args portion
+        '''
+        ret = super()._repr_args_str()
+        ret += ', resource_type={resource_type!r}, resource_name={resource_name!r}'
+        return ret
+
+    @staticmethod
+    def _str_fmt():
+        '''
+        Format basis for __str__
+        '''
+        return "/providers/{provider_name}/{resource_type}/{resource_name}"
+
+    ARGS_FROM_TEXT_TOKENS = 5
+
+    @staticmethod
+    def _args_from_text(text, toks, exc_desc=EXC_DESC_DEFAULT, exc_value=EXC_VALUE_DEFAULT):
+        '''
+        Given toks as an array of strings with length ARGS_FROM_TEXT_TOKENS,
+        parse it and return args for constructing an item of this type.
+        '''
+        expect_slots = ((0, ''), (1, 'providers'))
+        check_slots(text, toks, expect_slots, exc_desc=exc_desc, exc_value=exc_value)
+        return [toks[2], toks[3], toks[4]]
+
+    @classmethod
+    def values_check(cls, text, ret, resource_type=None, exc_value=EXC_VALUE_DEFAULT, **kwargs): # pylint: disable=arguments-differ
+        '''
+        ret is a ResourceId object derived from text.
+        Check ret values against kwargs.
+        '''
+        super().values_check(text, ret, exc_value=exc_value, **kwargs)
+        if resource_type and (resource_type.lower() != ret.resource_type.lower()):
+            raise exc_value("unexpected resource_type=%r != %r" % (ret.resource_type, resource_type))
+
+    def values_normalize(self, resource_type=None, **kwargs): # pylint: disable=arguments-differ
+        '''
+        Invoked during from_text() so that the result case-matches caller-provided values
+        '''
+        super().values_normalize(**kwargs)
+        if resource_type:
+            self.resource_type = resource_type
+
 @functools.total_ordering
 class AzSubscriptionResourceId(AzAnyResourceId):
     '''
@@ -257,11 +446,22 @@ class AzSubscriptionResourceId(AzAnyResourceId):
     '''
     def __init__(self,
                  subscription_id,
-                 exc_value=EXC_VALUE_DEFAULT):
-        super().__init__()
+                 exc_value=EXC_VALUE_DEFAULT,
+                 **kwargs):
+        super().__init__(exc_value=exc_value, **kwargs)
         self._exc_value = exc_value
         self.subscription_id = subscription_id
         self._exc_value = ValueError
+
+    @classmethod
+    def build(cls, subscription_id, values, exc_value=EXC_VALUE_DEFAULT, **kwargs):
+        '''
+        Create an object of this type with the given parameters.
+        '''
+        ret = cls(subscription_id,
+                  **kwargs)
+        ret.check_values_empty(values, exc_value=exc_value)
+        return ret
 
     @property
     def subscription_id(self):
@@ -286,12 +486,20 @@ class AzSubscriptionResourceId(AzAnyResourceId):
         # For other values, we are case-preserving.
         self._subscription_id = effective.lower()
 
+    @property
+    def subscription_scope(self):
+        '''
+        Getter for the scope of subscription_id.
+        '''
+        return f"/subscriptions/{self.subscription_id}"
+
     def fmt_vars(self):
         '''
         Return a dict of vars suitable for str.format
         '''
-        return {'subscription_id' : self.subscription_id,
-               }
+        ret = super().fmt_vars()
+        ret['subscription_id'] = self.subscription_id
+        return ret
 
     @staticmethod
     def _repr_args_str():
@@ -345,11 +553,24 @@ class AzSubscriptionProviderId(AzSubscriptionResourceId):
     def __init__(self,
                  subscription_id,
                  provider_name,
-                 exc_value=EXC_VALUE_DEFAULT):
-        super().__init__(subscription_id, exc_value=exc_value)
+                 exc_value=EXC_VALUE_DEFAULT,
+                 **kwargs):
+        super().__init__(subscription_id, exc_value=exc_value, **kwargs)
         self._exc_value = exc_value
         self.provider_name = provider_name
         self._exc_value = ValueError
+
+    @classmethod
+    def build(cls, subscription_id, values, exc_value=EXC_VALUE_DEFAULT, **kwargs):
+        '''
+        Create an object of this type with the given parameters.
+        '''
+        values = dict(values)
+        ret = cls(subscription_id,
+                  values.pop('provider_name'),
+                  **kwargs)
+        ret.check_values_empty(values, exc_value=exc_value)
+        return ret
 
     @property
     def provider_name(self):
@@ -434,12 +655,27 @@ class AzSubscriptionProviderResourceId(AzSubscriptionProviderId):
                  provider_name,
                  resource_type,
                  resource_name,
-                 exc_value=EXC_VALUE_DEFAULT):
-        super().__init__(subscription_id, provider_name, exc_value=exc_value)
+                 exc_value=EXC_VALUE_DEFAULT,
+                 **kwargs):
+        super().__init__(subscription_id, provider_name, exc_value=exc_value, **kwargs)
         self._exc_value = exc_value
         self.resource_type = resource_type
         self.resource_name = resource_name
         self._exc_value = ValueError
+
+    @classmethod
+    def build(cls, subscription_id, resource_name, values, exc_value=EXC_VALUE_DEFAULT, **kwargs): # pylint: disable=arguments-differ
+        '''
+        Create an object of this type with the given parameters.
+        '''
+        values = dict(values)
+        ret = cls(subscription_id,
+                  values.pop('provider_name'),
+                  values.pop('resource_type'),
+                  resource_name,
+                  **kwargs)
+        ret.check_values_empty(values, exc_value=exc_value)
+        return ret
 
     @property
     def resource_type(self):
@@ -542,11 +778,23 @@ class AzRGResourceId(AzSubscriptionResourceId):
     def __init__(self,
                  subscription_id,
                  resource_group_name,
-                 exc_value=EXC_VALUE_DEFAULT):
-        super().__init__(subscription_id, exc_value=exc_value)
+                 exc_value=EXC_VALUE_DEFAULT,
+                 **kwargs):
+        super().__init__(subscription_id, exc_value=exc_value, **kwargs)
         self._exc_value = exc_value
         self.resource_group_name = resource_group_name
         self._exc_value = ValueError
+
+    @classmethod
+    def build(cls, subscription_id, resource_group_name, values, exc_value=EXC_VALUE_DEFAULT, **kwargs): # pylint: disable=arguments-differ
+        '''
+        Create an object of this type with the given parameters.
+        '''
+        ret = cls(subscription_id,
+                  resource_group_name,
+                  **kwargs)
+        ret.check_values_empty(values, exc_value=exc_value)
+        return ret
 
     @property
     def resource_group_name(self):
@@ -616,13 +864,29 @@ class AzResourceId(AzRGResourceId):
                  provider_name,
                  resource_type,
                  resource_name,
-                 exc_value=EXC_VALUE_DEFAULT):
-        super().__init__(subscription_id, resource_group_name, exc_value=exc_value)
+                 exc_value=EXC_VALUE_DEFAULT,
+                 **kwargs):
+        super().__init__(subscription_id, resource_group_name, exc_value=exc_value, **kwargs)
         self._exc_value = exc_value
         self.provider_name = provider_name
         self.resource_type = resource_type
         self.resource_name = resource_name
         self._exc_value = ValueError
+
+    @classmethod
+    def build(cls, subscription_id, resource_group_name, resource_name, values, exc_value=EXC_VALUE_DEFAULT, **kwargs): # pylint: disable=arguments-differ
+        '''
+        Create an object of this type with the given parameters.
+        '''
+        values = dict(values)
+        ret = cls(subscription_id,
+                  resource_group_name,
+                  values.pop('provider_name'),
+                  values.pop('resource_type'),
+                  resource_name,
+                  **kwargs)
+        ret.check_values_empty(values, exc_value=exc_value)
+        return ret
 
     @property
     def provider_name(self):
@@ -754,12 +1018,30 @@ class AzSubResourceId(AzResourceId):
                  resource_name,
                  subresource_type,
                  subresource_name,
-                 exc_value=EXC_VALUE_DEFAULT):
-        super().__init__(subscription_id, resource_group_name, provider_name, resource_type, resource_name, exc_value=exc_value)
+                 exc_value=EXC_VALUE_DEFAULT,
+                 **kwargs):
+        super().__init__(subscription_id, resource_group_name, provider_name, resource_type, resource_name, exc_value=exc_value, **kwargs)
         self._exc_value = exc_value
         self.subresource_type = subresource_type
         self.subresource_name = subresource_name
         self._exc_value = ValueError
+
+    @classmethod
+    def build(cls, subscription_id, resource_group_name, resource_name, subresource_name, values, exc_value=EXC_VALUE_DEFAULT, **kwargs): # pylint: disable=arguments-differ
+        '''
+        Create an object of this type with the given parameters.
+        '''
+        values = dict(values)
+        ret = cls(subscription_id,
+                  resource_group_name,
+                  values.pop('provider_name'),
+                  values.pop('resource_type'),
+                  resource_name,
+                  values.pop('subresource_type'),
+                  subresource_name,
+                  **kwargs)
+        ret.check_values_empty(values, exc_value=exc_value)
+        return ret
 
     @property
     def subresource_type(self):
@@ -870,12 +1152,32 @@ class AzSub2ResourceId(AzSubResourceId):
                  subresource_name,
                  sub2resource_type,
                  sub2resource_name,
-                 exc_value=EXC_VALUE_DEFAULT):
-        super().__init__(subscription_id, resource_group_name, provider_name, resource_type, resource_name, subresource_type, subresource_name, exc_value=exc_value)
+                 exc_value=EXC_VALUE_DEFAULT,
+                 **kwargs):
+        super().__init__(subscription_id, resource_group_name, provider_name, resource_type, resource_name, subresource_type, subresource_name, exc_value=exc_value, **kwargs)
         self._exc_value = exc_value
         self.sub2resource_type = sub2resource_type
         self.sub2resource_name = sub2resource_name
         self._exc_value = ValueError
+
+    @classmethod
+    def build(cls, subscription_id, resource_group_name, resource_name, subresource_name, sub2resource_name, values, exc_value=EXC_VALUE_DEFAULT, **kwargs): # pylint: disable=arguments-differ
+        '''
+        Create an object of this type with the given parameters.
+        '''
+        values = dict(values)
+        ret = cls(subscription_id,
+                  resource_group_name,
+                  values.pop('provider_name'),
+                  values.pop('resource_type'),
+                  resource_name,
+                  values.pop('subresource_type'),
+                  subresource_name,
+                  values.pop('sub2resource_type'),
+                  sub2resource_name,
+                  **kwargs)
+        ret.check_values_empty(values, exc_value=exc_value)
+        return ret
 
     @property
     def sub2resource_type(self):
@@ -972,6 +1274,8 @@ class AzSub2ResourceId(AzSubResourceId):
             self.sub2resource_type = sub2resource_type
 
 RESOURCE_ID_CLASSES = (AzAnyResourceId,
+                       AzProviderId,
+                       AzProviderResourceId,
                        AzSubscriptionResourceId,
                        AzSubscriptionProviderId,
                        AzSubscriptionProviderResourceId,
@@ -981,7 +1285,7 @@ RESOURCE_ID_CLASSES = (AzAnyResourceId,
                        AzSub2ResourceId,
                       )
 
-def azresourceid_from_text(resource_id, exc_value=EXC_VALUE_DEFAULT, **kwargs):
+def azresourceid_from_text(resource_id, exc_desc=EXC_DESC_DEFAULT, exc_value=EXC_VALUE_DEFAULT, **kwargs):
     '''
     Given a resource ID, convert it to an appropriate ResourceId object.
     If exc_value is None, returns None if there is no valid conversion.
@@ -999,7 +1303,7 @@ def azresourceid_from_text(resource_id, exc_value=EXC_VALUE_DEFAULT, **kwargs):
         try:
             # Do not pass kwargs through here so we can distinguish between
             # a malformed/non-matching format versus non-matching values.
-            azrid = rid_class.from_text(resource_id, exc_value=InvalidConversion)
+            azrid = rid_class.from_text(resource_id, exc_desc=exc_desc, exc_value=InvalidConversion)
             break
         except InvalidConversion:
             continue
@@ -1017,6 +1321,10 @@ def azresourceid_from_text(resource_id, exc_value=EXC_VALUE_DEFAULT, **kwargs):
         except InvalidConversion:
             return None
 
+    # Now that values checks are complete, perform normalization.
+    with laaso.util.AttributeExcursion(azrid, exc_value=exc_value):
+        azrid.values_normalize(exc_value=exc_value, **kwargs)
+
     return azrid
 
 def azresourceid_or_none_from_text(resource_id, **kwargs):
@@ -1033,8 +1341,114 @@ def azresourceid_or_none_from_text(resource_id, **kwargs):
 
     try:
         ret = azresourceid_from_text(resource_id, exc_value=LocalValueError, **kwargs)
-    except LocalValueError:
+    except (LocalValueError, TypeError):
         return None
 
     assert isinstance(ret, AzAnyResourceId)
     return ret
+
+def azrid_normalize(resource_id, azrid_type, azrid_values, exc_value=EXC_VALUE_DEFAULT):
+    '''
+    Given resource_id, return it in the form of an object with type azrid_type.
+    Match values in azrid_values.
+    '''
+    assert issubclass(azrid_type, AzAnyResourceId)
+    assert exc_value
+    assert issubclass(exc_value, Exception)
+    if isinstance(resource_id, azrid_type):
+        # This assert will trip if resource_id is subresource of azrid_type
+        resource_id.values_sanity(azrid_values, exc_value=exc_value)
+        if resource_id.ARGS_FROM_TEXT_TOKENS != azrid_type.ARGS_FROM_TEXT_TOKENS:
+            raise exc_value(f"resource_id type {type(resource_id).__name__} is not {azrid_type.__name__}")
+        azrid = resource_id
+    else:
+        azrid = azrid_type.from_text(resource_id, **azrid_values, exc_value=exc_value)
+    return azrid
+
+def azrid_normalize_or_none(resource_id, azrid_type, azrid_values):
+    '''
+    Like azrid_normalize(), except that on any parsing error, return None rather than raising.
+    '''
+    class LocalValueError(ValueError):
+        '''
+        Used for exc_value in outcalls to intercept errors.
+        Defined within this method specifically so that this
+        does not match LocalValueError from any other method.
+        '''
+        # No specialization here.
+
+    try:
+        ret = azrid_normalize(resource_id, azrid_type, azrid_values, exc_value=LocalValueError)
+    except (LocalValueError, TypeError):
+        return None
+
+    assert isinstance(ret, AzAnyResourceId)
+    return ret
+
+def azrid_is(azrid, azrid_kls, **kwargs):
+    '''
+    Return whether azrid matches the given class (azrid_kls)
+    and the parameters (given as kwargs).
+    '''
+    if not isinstance(azrid, AzAnyResourceId):
+        raise TypeError(f"{getframename(0)} expected AzAnyResourceId for azrid but got {type(azrid)}")
+    if not issubclass(azrid_kls, AzAnyResourceId):
+        raise TypeError(f"{getframename(0)} expected AzAnyResourceId for azrid_kls but got {azrid_kls}")
+    if not isinstance(azrid, azrid_kls):
+        return False
+    if azrid.ARGS_FROM_TEXT_TOKENS != azrid_kls.ARGS_FROM_TEXT_TOKENS:
+        # azrid is an instance of azrid_kls but has a different token count.
+        # This can happen with a non-matching azrid or with a matching
+        # subresource.
+        return False
+    return azrid.values_match(**kwargs)
+
+RE_SUB_PREFIX = re.compile(r'^/subscriptions/([^/]+)(/.*$|$)', flags=re.IGNORECASE)
+
+def azresourceid_normalize_subscription_only(val):
+    '''
+    val is a string
+    If val represents a subscription ID, or a resource ID that begins with a subscription_id,
+    map and normalize it.
+    '''
+    m = RE_SUB_PREFIX.search(val)
+    if m:
+        return f"/subscriptions/{laaso._subscriptions.subscription_mapper.effective(m.group(1))}{m.group(2)}" # pylint: disable=protected-access
+    return laaso._subscriptions.subscription_mapper.effective(val) # pylint: disable=protected-access
+
+######################################################################
+# Specialized naming operations
+
+KEY_VAULT_NAME_LEN_MIN = 3
+KEY_VAULT_NAME_LEN_MAX = 24
+# Matching this regexp is necessary but not sufficient. External
+# callers must use keyvault_name_valid().
+_RE_KEY_VAULT_NAME_ABS = re.compile(r'^[a-zA-Z][a-zA-Z0-9-]{1,22}[a-zA-Z0-9]$')
+
+def keyvault_name_valid(name):
+    '''
+    Return whether name is valid for a keyvault
+    '''
+    if not isinstance(name, str):
+        return False
+    if (len(name) < KEY_VAULT_NAME_LEN_MIN) or (len(name) > KEY_VAULT_NAME_LEN_MAX):
+        return False
+    if '--' in name:
+        return False
+    if not _RE_KEY_VAULT_NAME_ABS.search(name):
+        return False
+    return True
+
+def keyvault_name_generate():
+    '''
+    Generate a name to use for a keyvault.
+    See https://docs.microsoft.com/en-us/azure/azure-resource-manager/management/resource-name-rules#microsoftkeyvault
+    '''
+    while True:
+        candidates = string.ascii_lowercase + string.digits + '-'
+        ret = random.choice(string.ascii_lowercase) # start with a letter
+        ret += ''.join([random.choice(candidates) for _ in range(random.randint(1, 22))]) # alphanumerics and hyphens
+        ret += random.choice(string.ascii_lowercase + string.digits) # end with a letter or digit
+        if not keyvault_name_valid(ret):
+            continue
+        return ret

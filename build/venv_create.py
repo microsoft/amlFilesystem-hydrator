@@ -107,9 +107,9 @@ class VenvCreate():
                             if self.requirement_is_excluded(line.rstrip()):
                                 continue
                             req_out.write(line)
-                self.run_cmd([self.pip_exe, '--no-color', '--use-feature=2020-resolver', 'install', '-r', req_path])
+                self.run_cmd([self.pip_exe, '--no-color', 'install', '-r', req_path])
         else:
-            self.run_cmd([self.pip_exe, '--no-color', '--use-feature=2020-resolver', 'install', '-r', self.requirements])
+            self.run_cmd([self.pip_exe, '--no-color', 'install', '-r', self.requirements])
 
         if not os.path.isdir(self.site_packages):
             raise Exception("self.site_packages %r does not exist or is not a directory" % self.site_packages)

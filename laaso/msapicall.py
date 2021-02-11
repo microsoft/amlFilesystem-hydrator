@@ -32,6 +32,7 @@ Some notes about polling object wrapping:
 '''
 import functools
 import http.client
+import inspect
 import logging
 import random
 import time
@@ -51,7 +52,6 @@ import azure.storage.blob._generated._azure_blob_storage
 import azure.storage.blob._generated.operations
 import azure.storage.blob._shared.base_client
 import azure.storage.filedatalake
-import azure.storage.filedatalake._generated.models
 import azure.storage.filedatalake._shared.base_client
 from defusedxml import ElementTree
 import knack.util
@@ -76,7 +76,8 @@ URLLIB3_SDK_EXCEPTIONS = (urllib3.exceptions.HTTPError,
                           urllib3.exceptions.HTTPWarning,
                          )
 
-AZURE_SDK_EXCEPTIONS = (azure.core.exceptions.HttpResponseError,
+AZURE_SDK_EXCEPTIONS = (azure.core.exceptions.AzureError,
+                        azure.core.exceptions.HttpResponseError,
                         knack.util.CLIError,
                         msrestazure.azure_exceptions.CloudError,
                        ) + URLLIB3_SDK_EXCEPTIONS
@@ -101,11 +102,23 @@ class Caught():
         # Because we insert msapicall in the low-level call stack, we can get
         # exceptions that are not yet mapped to what API callers expect.
         # Force mapping here.
-        if isinstance(exc, azure.storage.filedatalake._generated.models.StorageErrorException):
+
+        # We try to deserialize all exceptions through filedatalake here.
+        # This is inefficient. In older SDK versions, we could peek at the
+        # exception using a private exception class (StorageErrorException)
+        # to determine whether we should try to deserialize it here. Newer
+        # versions of the SDK do not offer any way to detect this, so we
+        # just pump everything through the undocumented private deserializer,
+        # which appears to either re-reraise the original exception if there is
+        # nothing else to translate, or fail with its own exception.
+        # In the absence of documentation, using the more narrow
+        # HttpResponseError over AzureError.
+        if isinstance(exc, azure.core.exceptions.HttpResponseError) and (not hasattr(exc, 'error_code')):
             try:
                 azure.storage.filedatalake._deserialize.process_storage_error(exc)
             except Exception as exc2:
-                exc = exc2
+                if isinstance(exc2, azure.core.exceptions.HttpResponseError):
+                    exc = exc2
 
         self.callpolicy = callpolicy or CallPolicy()
         assert isinstance(self.callpolicy, CallPolicy)
@@ -159,6 +172,14 @@ class Caught():
         return (self.status_code_int == http.client.CONFLICT) \
           or isinstance(self.exc, azure.common.AzureConflictHttpError)
 
+    def is_exists(self):
+        '''
+        Returns whether resource already exists
+        '''
+        if isinstance(self.exc, azure.core.exceptions.ResourceExistsError):
+            return True
+        return False
+
     def is_missing(self):
         '''
         Return whether this exception is caused by a missing resource
@@ -206,12 +227,20 @@ class Caught():
                        'HierarchicalNamespaceNotEnabled',
                        'InvalidParameter',
                        'InvalidResourceReference',
+                       'InvalidTemplate',
                        'LinkedInvalidPropertyId',
                        'MaxStorageAccountsCountPerSubscriptionExceeded',
+                       'NetworkSecurityGroupCannotBeAttachedToGatewaySubnet',
                        'OSProvisioningTimedOut',
+                       'PrincipalNotFound',
+                       'PrincipalTypeNotSupported',
                        'PropertyChangeNotAllowed',
+                       'Request_ResourceNotFound',
                        'ResourceGroupNotFound',
+                       'RoleAssignmentExists',
                        'SubnetHasServiceEndpointWithInvalidServiceName',
+                       'UnsupportedApiVersionForRoleDefinitionHasDataActions',
+                       'VaultAlreadyExists',
                        'VaultNameNotValid',
                       )
 
@@ -1019,3 +1048,31 @@ class AzLoginCredential(azure.identity._credentials.azure_cli.AzureCliCredential
                     raise
                 logger.warning("%s.%s did not succeed; will retry after %r", type(self).__name__, getframename(0), exc)
                 time.sleep(0.5)
+
+def methods_not_inherited_from(child_obj, parent_kls):
+    '''
+    child_obj is an instantiated object. parent_kls is some object type.
+    Return a list of (name, value) pairs from inspect.getmembers that
+    represent methods of child_obj that do not exist in parent_kls.
+    '''
+    assert not isinstance(child_obj, type)
+    assert isinstance(parent_kls, type)
+    # No reason here that child_obj must inherit from parent_kls,
+    # but all of our current callers believe this is the case,
+    # so assert it here. If this assert is problematic in the
+    # future, it may be removed or bypassed.
+    assert isinstance(child_obj, parent_kls)
+    child_methods = [x for x in inspect.getmembers(child_obj, inspect.ismethod) if not hasattr(parent_kls, x[0])]
+    return child_methods
+
+def wrap_child_only_methods(child_obj, parent_kls, logger):
+    '''
+    child_obj is an instantiated object. parent_kls is some object type.
+    Wrap any methods of child_obj that are not defined in parent_kls
+    so they go through msapicall.
+    No reason here that child_obj must inherit from parent_kls,
+    but all of our current callers believe this is the case.
+    '''
+    methods = methods_not_inherited_from(child_obj, parent_kls)
+    for name, value in methods:
+        setattr(child_obj, name, msapiwrapcall(value, logger))

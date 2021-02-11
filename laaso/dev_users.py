@@ -91,7 +91,7 @@ class DevUser():
             if not isinstance(val, bool):
                 raise exc_value("%r expected bool, not %s" % (k, type(val)))
 
-        if self.uid < 1:
+        if self.uid < 0:
             raise exc_value("invalid uid=%r for %r" % (self.uid, self))
 
         if not self.NAME_RE.search(self._name):
@@ -330,6 +330,9 @@ class DevServicePrincipal():
             self._additional_info.update(additional_info)
         self._additional_info = ReadOnlyDict(self._additional_info)
 
+    def __repr__(self):
+        return "%s(%r, %r, additional_info=%r)" % (type(self).__name__, self.display_name, self.object_id, self._additional_info)
+
     def __getattr__(self, name):
         return self._additional_info.get(name, '')
 
@@ -375,6 +378,7 @@ class DevServicePrincipal():
         for idx, user_desc in enumerate(sp_data):
             if not isinstance(user_desc, dict):
                 raise exc_value(f"service principal config {filename} data index {idx} is {type(user_desc)}; expected dict")
+            user_desc = dict(user_desc)
             try:
                 display_name = user_desc.pop('display_name')
             except KeyError as exc:
