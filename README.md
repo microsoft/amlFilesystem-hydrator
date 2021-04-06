@@ -23,16 +23,60 @@ hydrator.py supports most block blob and append blob storage
 account types in Azure, and it supports accounts with and
 without the Hierarchical Namespace feature enabled.
 
+## Prerequisites
+
+The hydrator requires access to an Azure Storage Account (SA) in order to import the
+namespace into Lustre.  Access is provided by means of a Shared Access Signature(SAS)
+token.  In order to keep the SAS token secure, the token is kept in an Azure Key Vault.
+Access to the Key Vault is controlled via a Managed Identity, which is assigned to the
+VM on which the hydrator runs.
+
+### Setup the Azure Key Vault
+
+Create an Azure Key Vault.  Ensure that you follow recommended security practices to
+limit subnets that can communicate with the Key Vault.
+
+### Generate a SAS token
+
+Create a SAS token with the lowest level of access privileges possible for the application.
+For a hydration-only scenario (no plan for Archive), grant `Read` and `List` permissions.
+A short lifespan for the token is strongly encouraged.  Limit the SAS token to a container
+within the Storage Account if possible, rather than the entire Storage Account.
+
+If generating a token to be used with the [copytool](https://github.com/wastore/lemur/),
+ensure that `Write` and `Create` are also specified as permissions.
+
+### Put SAS token into the Key Vault
+
+The SAS token to place into the Key Vault should be the one that begins with '?' (the question mark).
+Create a new Secret, and use the SAS token as the value.
+
+### VM Identity
+
+Create a new Identity for the VM.  This can be `System assigned` or `User assigned`.
+
+### Configure RBAC and Access policies of the Key Vault
+
+#### RBAC
+
+Under the `Access Control (IAM)` configuration of the Key Vault, assign the `Key Vault Secrets User`
+permission to the VM Identity.
+
+#### Access policies
+
+Under the `Access policy` configuration of the Key Vault, `Add Access Policy`, and select
+`Get` and `List` for `Secret permissions`.  Select the `VM Identity` where `Select principal` is required.
+
 ## Installing the virtualenv
 
 You must create and install a Python virtual environment
 before running hydrator.py.  This environment ensures that
-all of the required packages and depdencies are properly
+all of the required packages and dependencies are properly
 installed and downloaded before using the tool.
 
 Create the virtual environment by running this script
 from the root of the repo.  Replace "hydrator_venv" with
-the direcory where you would like the virtual env to be installed.
+the directory where you would like the virtual env to be installed.
 
 ```bash
 #!/bin/bash
@@ -62,26 +106,29 @@ You must run hydrator.py as the root user since it may need to perform
 several operations that require root privileges, such as chown.
 
 The examples provided use the following variables:
+
 * *``mystorageacct``*  refers the the name that you chose for
 the storage account when creating it.
 * *``mycontainer``* refers to the container that you wish to import within
 ``mystorageacct``.
-* *``mysas``* is a shared access signature (SAS) token generated for
-``mystorageacct`` (starting with the ? character) that includes at least
-read and list permissions on the blobs and containers.
+* *``mysecret``* is the name of the secret in the Key Vault where the SAS token is stored.
+* *``mykv``* is the name of the Key Vault where the SAS token is stored.  This is not the
+  entire URL for the Key Vault (https://mykv.vault.azure.net/).
 
 You must place quotes around the SAS token to ensure that it is
 interpreted properly by the command-line parser.
 
 To import an entire storage account container into a Lustre mount at /mnt/lustre:
+
 ```bash
-(hydrator_venv)# PYTHONPATH=. laaso/hydrator.py "mystorageacct" "mycontainer" "mysas" -a /mnt/lustre --lemur
+(hydrator_venv)# PYTHONPATH=. laaso/hydrator.py "mystorageacct" "mycontainer" "mysecret" -k -n "mykv" -a /mnt/lustre --lemur
 ```
 
-To do the same as the above, but only import blobs whose names start with 
+To do the same as the above, but only import blobs whose names start with
 prefix "some/prefix":
+
 ```bash
-(hydrator_venv)# PYTHONPATH=. laaso/hydrator.py "mystorageacct" "mycontainer" "mysas" -a /mnt/lustre -p "some/prefix" --lemur
+(hydrator_venv)# PYTHONPATH=. laaso/hydrator.py "mystorageacct" "mycontainer" "mysecret" -k -n "mykv" -a /mnt/lustre -p "some/prefix" --lemur
 ```
 
 Note: the --lemur flag is required for compatibility with copytools
@@ -96,12 +143,14 @@ files when they are specified in blob metadata.
 Set the following metadata fields on a blob using the Azure portal to give the
 file corresponding POSIX attributes when the file is imported into the Lustre
 name space:
+
 * ``owner``: uid
 * ``group``: gid
 * ``permissions``: permissions
 
 If applying blob metadata attributes using REST or SDK calls, you may need
-to apply blob metadata attributes prepended with 'x-ms-meta-': 
+to apply blob metadata attributes prepended with 'x-ms-meta-':
+
 * ``x-ms-meta-owner``: uid
 * ``x-ms-meta-group``: gid
 * ``x-ms-meta-permissions``: permissions
