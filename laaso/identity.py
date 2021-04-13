@@ -75,7 +75,7 @@ def uami_azrid_from_str(val, az_mgr):
                 if not isinstance(uami_data, dict):
                     continue
                 uami_name = uami_data.get('name', '')
-                if uami_name != toks[0]:
+                if uami_name.lower() != toks[0].lower():
                     continue
                 resource_group = uami_data.get('resource_group', '')
                 if not resource_group:
@@ -84,8 +84,7 @@ def uami_azrid_from_str(val, az_mgr):
                                     resource_group,
                                     'Microsoft.ManagedIdentity',
                                     'userAssignedIdentities',
-                                    uami_name,
-                                    exc_value=LocalValueError)
+                                    uami_name)
         return None
 
     if az_mgr and (len(toks) == 2):
@@ -124,10 +123,7 @@ def identity_from_uami_str(val, az_mgr):
     azrid = uami_azrid_from_str(val, az_mgr)
     if not azrid:
         return ''
-
-    uami = az_mgr.user_assigned_identity_get(subscription_id=azrid.subscription_id,
-                                             resource_group=azrid.resource_group_name,
-                                             name=azrid.resource_name)
+    uami = az_mgr.user_assigned_identity_get_by_id(azrid)
     return uami
 
 def client_id_from_verify_client_id_in_config(val):
@@ -250,9 +246,7 @@ def logical_name_for_object_id(object_id, az_mgr, adobj=None):
                 return adobj.user_principal_name
         except AttributeError:
             pass
-        try:
-            if adobj.display_name:
-                return adobj.display_name
-        except AttributeError:
-            pass
+        display_name = getattr(adobj, 'display_name', '')
+        if display_name:
+            return display_name
     return f"unrecognized object_id {object_id!r}"

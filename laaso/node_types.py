@@ -23,13 +23,6 @@ class NodeType(EnumMixin, enum.Enum):
     AGTSTD = 'AgentStandard'
     LCLIENT = 'LustreClient'
 
-    @classmethod
-    def all_keys(cls):
-        '''
-        return set of nodetype enum
-        '''
-        return set(cls.values())
-
 class AnsibleNodeType(EnumMixin, enum.Enum):
     '''
     Ansible playbooks introduce an additional type MGS
@@ -40,13 +33,7 @@ class AnsibleNodeType(EnumMixin, enum.Enum):
     AGTPRI = 'agtpri'
     AGTSTD = 'agtstd'
     LCLIENT = 'client'
-
-    @classmethod
-    def all_keys(cls):
-        '''
-        return set of nodetype enum
-        '''
-        return set(cls.values())
+    SHP = 'shp'  # there is no NodeType equivalent of shp since deploy_cluster does not deploy it
 
 _ANTYPE_NTYPE = {
     AnsibleNodeType.MGS.value: NodeType.MDS.value,
@@ -54,7 +41,7 @@ _ANTYPE_NTYPE = {
     AnsibleNodeType.OSS.value: NodeType.OSS.value,
     AnsibleNodeType.AGTPRI.value: NodeType.AGTPRI.value,
     AnsibleNodeType.AGTSTD.value: NodeType.AGTSTD.value,
-    AnsibleNodeType.LCLIENT.value: NodeType.LCLIENT.value
+    AnsibleNodeType.LCLIENT.value: NodeType.LCLIENT.value,
 }
 
 _NTYPE_ANTYPE = {
@@ -62,7 +49,7 @@ _NTYPE_ANTYPE = {
     NodeType.OSS.value: AnsibleNodeType.OSS.value,
     NodeType.AGTPRI.value: AnsibleNodeType.AGTPRI.value,
     NodeType.AGTSTD.value: AnsibleNodeType.AGTSTD.value,
-    NodeType.LCLIENT.value: AnsibleNodeType.LCLIENT.value
+    NodeType.LCLIENT.value: AnsibleNodeType.LCLIENT.value,
 }
 
 def ntype_ansntype(ntype):
@@ -79,6 +66,8 @@ def ansntype_ntype(ansntype):
     translater ansntype str to valid node type
     '''
     if isinstance(ansntype, enum.Enum):
+        assert ansntype != AnsibleNodeType.SHP
         return _ANTYPE_NTYPE[ansntype.value]
     assert isinstance(ansntype, str)
+    assert ansntype != AnsibleNodeType.SHP.value
     return _ANTYPE_NTYPE[ansntype]

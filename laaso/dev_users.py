@@ -29,6 +29,7 @@ class DevUser():
                  kv_admin_cert=False,
                  kv_admin_key=False,
                  kv_admin_secret=False,
+                 mlct=False, # Managed Lustre Customer Testing
                  mocked=False,
                  rg_add_users=False,
                  vm_devel_admin=False,
@@ -40,10 +41,11 @@ class DevUser():
         self._build_agent_admin = build_agent_admin
         self._jumphost = jumphost
         self._jumphost_root = jumphost_root
-        self._mocked = mocked # for testing
         self._kv_admin_cert = kv_admin_cert
         self._kv_admin_key = kv_admin_key
         self._kv_admin_secret = kv_admin_secret
+        self._mlct = mlct
+        self._mocked = mocked # for testing
         self._name = kwargs.pop('name')
         self._rbac = kwargs.pop('rbac', list()) # not fully validated here
         self._rg_add_users = rg_add_users
@@ -144,6 +146,7 @@ class DevUser():
                            'kv_admin_key',
                            'kv_admin_secret',
                            'kv_user',
+                           'mlct',
                            'mocked',
                            'name',
                            'owner_allowed',

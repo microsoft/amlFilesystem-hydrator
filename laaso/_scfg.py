@@ -93,7 +93,7 @@ class _Scfg():
         if isinstance(data, dict):
             return ReadOnlyDict({kk : self._data_validate(vv, unamestack=f'{unamestack}[{kk}]', hnamestack=f'{hnamestack}__{kk}', required=required, exc_value=exc_value) for kk, vv in data.items()})
         if isinstance(data, list):
-            return tuple([self._data_validate(vv, unamestack=f'{unamestack}[{idx}]', hnamestack=f'{hnamestack}__contents', required=required, exc_value=exc_value) for idx, vv in enumerate(data)])
+            return tuple(self._data_validate(vv, unamestack=f'{unamestack}[{idx}]', hnamestack=f'{hnamestack}__contents', required=required, exc_value=exc_value) for idx, vv in enumerate(data))
         raise exc_value("%s has unexpected type %s" % (unamestack, type(data)))
 
     @staticmethod

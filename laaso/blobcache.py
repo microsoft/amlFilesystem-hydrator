@@ -120,8 +120,8 @@ class BlobAttributes():
 
     # regex's for the various permission bit formats that azure supports
     # Azure supports the sticky bit and the owner/group/world perms.
-    MODE_RE_OCTAL = re.compile('[0-1][0-7]{3}')
-    MODE_RE_STR = re.compile('([r-][w-][x-]){3}[t]{0,1}')
+    MODE_RE_OCTAL = re.compile('^[0-1][0-7]{3}$')
+    MODE_RE_STR = re.compile('^([r-][w-][x-]){3}[t]{0,1}$')
 
     NSEC_PER_SEC = 1000 * 1000 * 1000
 
@@ -472,10 +472,11 @@ class BlobCache(multiprocessing.Process):
 
     def blobop_container_bundle_generate(self):
         '''
-        Get a BlobOpBundle for the container
+        Get a StorageOpBundle for the container
         '''
         cn = ContainerName(self.storage_acct, self.container, subscription_id=self.subscription_id)
-        blobop = self.manager.blobop_bundle_get(cn, credential=self.credential)
+        blobop = self.manager.storage_op_bundle_get(cn, credential=self.credential)
+        blobop.sa_key_prep()
         return blobop
 
     def start_generator(self):
@@ -487,7 +488,7 @@ class BlobCache(multiprocessing.Process):
         if blobop.hns_enabled and BlobAttributes.USE_HNS_ATTRIBUTES:
             self.blobs = blobop.filesystemclient.get_paths(path=name_starts_with, recursive=True)
         else:
-            self.blobs = blobop.blob_names_iter_get(name_starts_with=name_starts_with, include='metadata')
+            self.blobs = blobop.blob_properties_iter_get(name_starts_with=name_starts_with, include='metadata')
 
     def read_blob(self, blob):
         '''
@@ -499,7 +500,8 @@ class BlobCache(multiprocessing.Process):
         '''
         if BlobAttributes.symlink_hint(blob):
             bn = BlobName(self.storage_acct, self.container, blob.name, subscription_id=self.subscription_id)
-            blobop = self.manager.blobop_bundle_get(bn, credential=self.credential)
+            blobop = self.manager.storage_op_bundle_get(bn, credential=self.credential)
+            blobop.sa_key_prep()
             blob_stream = blobop.blobclient.download_blob(offset=0, length=BlobAttributes.PATH_MAX)
             return blob_stream.content_as_bytes()
         return None

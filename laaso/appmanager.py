@@ -21,6 +21,12 @@ class ManagerMixin():
     # Handy hook for unit testing
     MANAGER_CLASS = laaso.azure_tool.Manager
 
+    # az_mgr_discard() checks these attributes.
+    # subclasses may overload this.
+    AZ_MGR_DISCARD_ATTRS = {'_az_mgr',
+                            'az_mgr',
+                           }
+
     def subscription_defaults_generate(self, az_mgr=None):
         '''
         Generate a pared-down subscription_defaults.
@@ -62,12 +68,13 @@ class ManagerMixin():
             pass
 
         ret = laaso.scfg.to_scfg_dict(**kwargs)
+        si = laaso.subscription_info_get(az_mgr.subscription_id)
 
         for key in ('msi_client_id_default',
                     'pubkey_keyvault_client_id',
                    ):
             try:
-                val_pre = ret['defaults'][key]
+                val_pre = si[key]
             except KeyError:
                 val_pre = laaso.scfg.get(key, '')
             if val_pre:
@@ -112,6 +119,19 @@ class ManagerMixin():
         mk.update(kwargs)
         ret = self.MANAGER_CLASS(**mk)
         return ret
+
+    def az_mgr_discard(self):
+        '''
+        Discard references to Manager-like objects.
+        This allows reclaiming of unshared connection pools in SDK client classes.
+        Check attrs defined by AZ_MGR_DISCARD_ATTRS.
+        If they are instances of laaso.azure_tool.Manager or MANAGER_CLASS,
+        set them to None
+        '''
+        for attr in self.AZ_MGR_DISCARD_ATTRS:
+            curval = getattr(self, attr, None)
+            if isinstance(curval, (laaso.azure_tool.Manager, self.MANAGER_CLASS)):
+                setattr(self, attr, None)
 
 class ApplicationWithManager(laaso.common.Application, ManagerMixin):
     '''

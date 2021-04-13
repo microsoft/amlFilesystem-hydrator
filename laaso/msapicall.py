@@ -34,7 +34,9 @@ import functools
 import http.client
 import inspect
 import logging
+import os
 import random
+import threading
 import time
 import urllib.parse
 
@@ -46,6 +48,7 @@ import azure.graphrbac
 import azure.identity
 import azure.identity._credentials
 import azure.mgmt.core.polling.arm_polling
+import azure.mgmt.loganalytics
 import azure.mgmt.msi
 import azure.profiles.multiapiclient
 import azure.storage.blob._generated._azure_blob_storage
@@ -63,8 +66,9 @@ import msrestazure.polling.arm_polling
 import urllib3.exceptions
 
 from laaso.exceptions import ApplicationException
-from laaso.util import (elapsed,
-                        indent_exc,
+import laaso.util
+from laaso.util import (RE_UUID_RE,
+                        elapsed,
                         indent_pformat,
                         getframe,
                         getframename,
@@ -87,12 +91,16 @@ class CallPolicy():
     Call retry policy
     '''
     def __init__(self,
+                 additional_exceptions=None,
                  max_attempts_other=5,
                  max_attempts_throttle=100,
-                 no_retry_classes=None):
+                 no_retry_classes=None,
+                 nohandle_exceptions=None):
+        self.additional_exceptions = additional_exceptions or tuple()
         self.max_attempts_other = max_attempts_other
         self.max_attempts_throttle = max_attempts_throttle
         self.no_retry_classes = no_retry_classes or set()
+        self.nohandle_exceptions = nohandle_exceptions or tuple()
 
 class Caught():
     '''
@@ -102,23 +110,6 @@ class Caught():
         # Because we insert msapicall in the low-level call stack, we can get
         # exceptions that are not yet mapped to what API callers expect.
         # Force mapping here.
-
-        # We try to deserialize all exceptions through filedatalake here.
-        # This is inefficient. In older SDK versions, we could peek at the
-        # exception using a private exception class (StorageErrorException)
-        # to determine whether we should try to deserialize it here. Newer
-        # versions of the SDK do not offer any way to detect this, so we
-        # just pump everything through the undocumented private deserializer,
-        # which appears to either re-reraise the original exception if there is
-        # nothing else to translate, or fail with its own exception.
-        # In the absence of documentation, using the more narrow
-        # HttpResponseError over AzureError.
-        if isinstance(exc, azure.core.exceptions.HttpResponseError) and (not hasattr(exc, 'error_code')):
-            try:
-                azure.storage.filedatalake._deserialize.process_storage_error(exc)
-            except Exception as exc2:
-                if isinstance(exc2, azure.core.exceptions.HttpResponseError):
-                    exc = exc2
 
         self.callpolicy = callpolicy or CallPolicy()
         assert isinstance(self.callpolicy, CallPolicy)
@@ -139,7 +130,14 @@ class Caught():
             self.error_code = str(exc.error_code)
         elif hasattr(exc, 'error') and hasattr(exc.error, 'code') and exc.error.code:
             self.error_code = str(exc.error.code)
-        else:
+
+        if self.error_code is None:
+            try:
+                self.error_code = exc.response.headers.get('x-ms-error-code')
+            except AttributeError:
+                pass
+
+        if self.error_code is None:
             # pre-track2
             try:
                 self.error_code = str(exc.error.error)
@@ -226,10 +224,12 @@ class Caught():
                        'ExpiredAuthenticationToken',
                        'HierarchicalNamespaceNotEnabled',
                        'InvalidParameter',
+                       'InvalidResourceLocation',
                        'InvalidResourceReference',
                        'InvalidTemplate',
                        'LinkedInvalidPropertyId',
                        'MaxStorageAccountsCountPerSubscriptionExceeded',
+                       'NetcfgInvalidSubnet',
                        'NetworkSecurityGroupCannotBeAttachedToGatewaySubnet',
                        'OSProvisioningTimedOut',
                        'PrincipalNotFound',
@@ -324,6 +324,8 @@ def msapicall(logger, op, *args, laaso_callpolicy=None, **kwargs):
     Internally, do some amount of retry on errors.
     '''
     callpolicy = laaso_callpolicy or CallPolicy()
+    exceptions_to_handle = AZURE_SDK_EXCEPTIONS + callpolicy.additional_exceptions
+    nohandle_exceptions = (KeyboardInterrupt,) + callpolicy.nohandle_exceptions
     last_reason = None
     attempt_all = 0
     attempt_this_reason = 0
@@ -331,7 +333,9 @@ def msapicall(logger, op, *args, laaso_callpolicy=None, **kwargs):
         try:
             ret = op(*args, **kwargs)
             break
-        except AZURE_SDK_EXCEPTIONS as exc:
+        except nohandle_exceptions:
+            raise
+        except exceptions_to_handle as exc:
             caught = Caught(exc, callpolicy=callpolicy)
             sleep_secs = caught.retry_time()
             if sleep_secs is None:
@@ -385,6 +389,26 @@ def msapiwrap(logger, ret):
                           azure.graphrbac.operations.users_operations.UsersOperations,
                           azure.graphrbac.operations.objects_operations.ObjectsOperations,
                           azure.graphrbac.operations.domains_operations.DomainsOperations,
+                          azure.mgmt.loganalytics.operations.AvailableServiceTiersOperations,
+                          azure.mgmt.loganalytics.operations.ClustersOperations,
+                          azure.mgmt.loganalytics.operations.DataExportsOperations,
+                          azure.mgmt.loganalytics.operations.DataSourcesOperations,
+                          azure.mgmt.loganalytics.operations.DeletedWorkspacesOperations,
+                          azure.mgmt.loganalytics.operations.GatewaysOperations,
+                          azure.mgmt.loganalytics.operations.IntelligencePacksOperations,
+                          azure.mgmt.loganalytics.operations.LinkedServicesOperations,
+                          azure.mgmt.loganalytics.operations.LinkedStorageAccountsOperations,
+                          azure.mgmt.loganalytics.operations.ManagementGroupsOperations,
+                          azure.mgmt.loganalytics.operations.OperationStatusesOperations,
+                          azure.mgmt.loganalytics.operations.Operations,
+                          azure.mgmt.loganalytics.operations.SavedSearchesOperations,
+                          azure.mgmt.loganalytics.operations.SchemaOperations,
+                          azure.mgmt.loganalytics.operations.SharedKeysOperations,
+                          azure.mgmt.loganalytics.operations.StorageInsightConfigsOperations,
+                          azure.mgmt.loganalytics.operations.TablesOperations,
+                          azure.mgmt.loganalytics.operations.UsagesOperations,
+                          azure.mgmt.loganalytics.operations.WorkspacePurgeOperations,
+                          azure.mgmt.loganalytics.operations.WorkspacesOperations,
                           azure.mgmt.msi.operations.user_assigned_identities_operations.UserAssignedIdentitiesOperations,
                          )):
         ret = LaaSO_OperationsWrapper(ret, logger)
@@ -396,6 +420,29 @@ def msapiwrap(logger, ret):
                   'users',
                   'objects',
                   'domains'):
+            setattr(ret, a, msapiwrap(logger, getattr(ret, a)))
+        ret = LaaSO_OperationsWrapper(ret, logger)
+    elif isinstance(ret, azure.mgmt.loganalytics.LogAnalyticsManagementClient):
+        for a in ('available_service_tiers',
+                  'clusters',
+                  'data_exports',
+                  'data_sources',
+                  'deleted_workspaces',
+                  'gateways',
+                  'intelligence_packs',
+                  'linked_services',
+                  'linked_storage_accounts',
+                  'management_groups',
+                  'operation_statuses',
+                  'operations',
+                  'saved_searches',
+                  'schema',
+                  'shared_keys',
+                  'storage_insight_configs',
+                  'tables',
+                  'usages',
+                  'workspace_purge',
+                  'workspaces'):
             setattr(ret, a, msapiwrap(logger, getattr(ret, a)))
         ret = LaaSO_OperationsWrapper(ret, logger)
     elif isinstance(ret, azure.mgmt.msi.managed_service_identity_client.ManagedServiceIdentityClient):
@@ -472,8 +519,17 @@ class LaaSO_LROPoller_topmixin():
     @classmethod
     def add_to_obj(cls, obj, new_class, logger):
         '''
-        Simulate obj inheriting from new_class
+        Simulate obj inheriting from new_class.
+        It would be nice to update obj.wait here rather than requiring
+        callers to explicitly use laaso_lro_wait(), but for that operation
+        to be useful, it needs to know the logical name of the operation.
+        Here, there's no non-brittle way to extract that. We could try
+        crawling up the stack and looking at object types and method names,
+        but that's subject to changes in autorest. The same goes for
+        attempting to scrape it from obj._polling_method._deserialization_callback.
         '''
+        if not hasattr(obj, 'laaso_time_start'):
+            obj.laaso_time_start = time.time()
         obj._polling_method = msapiwrap(logger, obj._polling_method) # pylint: disable=protected-access
         if not hasattr(obj, 'operation_id_get'):
             obj.operation_id_get = functools.partial(cls.operation_id_get, obj)
@@ -499,19 +555,6 @@ class LaaSO_LROPoller_topmixin():
             return self._thread
         except AttributeError:
             return None
-
-    def wait(self, *args, **kwargs):
-        '''
-        Wrap wait to log extra diagnostics
-        '''
-        try:
-            super().wait(*args, **kwargs)
-        except Exception as exc:
-            logger = _logger_for_obj(self)
-            logger.warning("%s.%s wait failed (thread=%r) (operation_id=%s): %s\n%s",
-                           type(self).__name__, getframename(0), self.thread_get(), self.operation_id_get(), exc,
-                           indent_exc())
-            raise
 
 class LaaSO_LROPoller_azure_core(azure.core.polling._poller.LROPoller): # pylint: disable=protected-access
     '''
@@ -580,6 +623,8 @@ class LaaSO_LongRunningOperation_msrestazure(msrestazure.polling.arm_polling.Lon
         '''
         Simulate obj inheriting from cls by explicitly inserting things that are not overloads
         '''
+        if not hasattr(obj, 'laaso_time_start'):
+            obj.laaso_time_start = time.time()
         obj.logger = logger
         obj.operation_id_get = functools.partial(cls.operation_id_get, obj)
         obj.__class__ = cls
@@ -596,6 +641,26 @@ class LaaSO_LongRunningOperation_msrestazure(msrestazure.polling.arm_polling.Lon
             return None
         return _operation_id_from_url(url, logger=logger)
 
+# LAASO_MIN_DELAY_DEFAULT and LAASO_MAX_DELAY_DFAULT are
+# the default lower and upper bounds for the delay periodicity
+# for LRO wait operations. Individual callers of those wait
+# operations may choose to adjust one or both of these
+# values. Setting a value to None means "no limit", which
+# really means "leave it up to _delay_time_for_polling()".
+# If we do too much polling, we'll hit throttling errors.
+LAASO_MIN_DELAY_DEFAULT =  5
+LAASO_MAX_DELAY_DEFAULT = 30
+
+def _delay_time_constrain(val, val_min, val_max):
+    '''
+    Apply min and max constraints to val.
+    '''
+    if val_min is not None:
+        val = max(val, val_min)
+    if val_max is not None:
+        val = min(val, val_max)
+    return val
+
 def _delay_time_for_polling(time0, default):
     '''
     time0 is the beginning of the operation, or the best
@@ -610,25 +675,161 @@ def _delay_time_for_polling(time0, default):
     unnecessarily long. Later, back off to reduce the number
     of polling ops in the sub in an attempt to avoid
     getting throttled.
+
+    The range of values this operation may return can fall
+    outside the range [LAASO_MIN_DELAY_DEFAULT, LAASO_MAX_DELAY_DEFAULT].
+    That's intentional; it's up to the caller to apply those
+    constraints when applicable.
     '''
     el = elapsed(time0)
     if el <= 0.2:
         return 0.1
     if el < 3:
+        return 0.5
+    if el < 5:
         return 1
     if el < 10:
         return min(default, 5)
     if el < 60:
         return min(default, 10)
     if el < 180:
-        return min(default, 15)
-    # From here on, ignore default.
-    # If we do too much polling, we'll hit throttling errors.
-    if el < 360:
-        return 30
+        return min(default, 20)
+    # From here on, ignore default - we'll intentionally
+    # wait longer than that to reduce the probability
+    # of throttling errors, if the caller constraint allows
+    # us to do so. Most callers do not. That's okay.
     if el < 900:
         return 60
     return 90
+
+def laaso_lro_operation_id(op, logger, caller=None):
+    '''
+    op is an LRO op for an async operation.
+
+    Extract and return the operation_id when possible.
+    '''
+    caller = caller or getframe(1)
+
+    if isinstance(op, azure.mgmt.resource.resources.models.DeploymentExtended):
+        try:
+            # Not really a polling op - the deployment is running in the background,
+            # and this is the result of creating the deployment.
+            # There's no operation_id in this object, so return what we have.
+            return op.properties.correlation_id
+        except Exception as exc:
+            logger.warning("%s op.properties.correlation_id %r", caller, exc)
+        return None
+
+    operation_id = getattr(op, 'operation_id', None)
+    if operation_id:
+        return operation_id
+
+    operation_id_get = getattr(op, 'operation_id_get', None)
+    if operation_id_get:
+        return operation_id_get()
+
+    try:
+        _polling_method = op._polling_method # pylint: disable=protected-access
+    except Exception as exc:
+        logger.warning("%s op._polling_method %r", caller, exc)
+        return None
+
+    if _polling_method:
+        operation_id = getattr(_polling_method, 'operation_id', None)
+        if operation_id:
+            return operation_id
+
+    try:
+        _operation = _polling_method._operation # pylint: disable=protected-access
+    except Exception as exc:
+        logger.warning("%s op._polling_method._operation %r", caller, exc)
+        return None
+
+    if isinstance(_operation, msrestazure.polling.arm_polling.LongRunningOperation):
+        try:
+            status_link = _operation.get_status_link()
+        except msrestazure.polling.arm_polling.BadResponse:
+            if _operation.method == 'PATCH':
+                status_link = _operation.initial_response.request.url
+            else:
+                status_link = ''
+        if status_link and isinstance(status_link, str):
+            path = ''
+            try:
+                parsed = urllib.parse.urlparse(status_link)
+            except Exception as exc:
+                logger.warning("%s op._polling_method._operation.get_status_link()=%r cannot parse: %r", caller, status_link, exc)
+                parsed = None
+            if parsed:
+                path = getattr(parsed, 'path', '')
+            if path:
+                pathtoks = path.split('/')
+                if (len(pathtoks) >= 2) and (pathtoks[-2].lower() == 'operations'):
+                    return pathtoks[-1]
+
+    try:
+        location_url = _operation.location_url
+    except Exception as exc:
+        logger.warning("%s op._polling_method._operation.location_url %r", caller, exc)
+        return None
+
+    if not location_url:
+        # If we have an operation_id attribute, then either the SDK version we are using
+        # contains bugfixes/improvements that obviate it or we are going through a LaaSO
+        # wrapper. Either way, it is more likely that the operation should not have
+        # an ID (for example, a no-op patch) than it is that this is a problem, so only
+        # log a warning when there is no operation_id attribute.
+        if not hasattr(_operation, 'operation_id'):
+            logger.warning("%s op._polling_method._operation.location_url for %s is %r; returning None", caller, type(_operation), location_url)
+        return None
+
+    try:
+        toks = location_url.split('/')
+    except Exception as exc:
+        logger.warning("%s op._polling_method._operation.location_url.split('/') %r %r", caller, location_url, exc)
+        return None
+    prev_tok = toks[0]
+    for tok in toks[1:]:
+        if prev_tok.lower() == 'operations':
+            m = RE_UUID_RE.search(tok)
+            if m:
+                return m.group(0)
+            break
+        prev_tok = tok
+    logger.warning("%s cannot parse op._polling_method._operation.location_url %r", caller, location_url)
+    return None
+
+LAASO_LRO_WAIT_LOG_PREFIX = 'laaso_lro_wait'
+
+LAASO_LRO_WAIT_ELAPSED_LOG_LEVEL_DEFAULT = laaso.util.log_level_normalize(os.environ.get('LAASO_LRO_WAIT_ELAPSED_LOG_LEVEL_DEFAULT', None), none_ok=True)
+
+def laaso_lro_wait(op, name, logger, **kwargs):
+    '''
+    op is a top-level LRO polling object.
+    Wait for it.
+    '''
+    # log_level_elapsed is not an explicit kwarg so LAASO_LRO_WAIT_ELAPSED_LOG_LEVEL_DEFAULT
+    # may be updated
+    log_level_elapsed = kwargs.pop('log_level_elapsed', LAASO_LRO_WAIT_ELAPSED_LOG_LEVEL_DEFAULT)
+    if kwargs:
+        raise TypeError("%s: unexpected keyword arguments %s" % (getframename(0), ','.join(kwargs.keys())))
+    if not op:
+        return None
+    t0 = op.laaso_time_start
+    exc_str = ''
+    try:
+        ret = op.wait()
+        exc_str = " (success)"
+        return ret
+    except Exception as exc:
+        exc_str = " (exc %r)" % exc
+        raise
+    finally:
+        if log_level_elapsed is not None:
+            t1 = time.time()
+            el = elapsed(t0, t1)
+            opid = laaso_lro_operation_id(op, logger, caller=f"{getframe(0)}/{getframe(1)}")
+            logger.log(log_level_elapsed, "%s %s (id %r) %s elapsed %.3f%s", LAASO_LRO_WAIT_LOG_PREFIX, name, opid, hex(id(op)), el, exc_str)
 
 class LaaSO_ARMPolling_mgmt_core(azure.mgmt.core.polling.arm_polling.ARMPolling):
     '''
@@ -655,14 +856,26 @@ class LaaSO_ARMPolling_mgmt_core(azure.mgmt.core.polling.arm_polling.ARMPolling)
         except AttributeError:
             time0 = time.time()
             self._laaso_time0 = time0 # pylint: disable=attribute-defined-outside-init
+            # This is the first call to _delay since reconstructing
+            # and there is no operation_id. This could be an operation
+            # that completed synchronously. Return a delay of 0
+            # just this once.
+            return 0
         default = super()._extract_delay()
-        return _delay_time_for_polling(time0, default)
+        ret = _delay_time_for_polling(time0, default)
+        ret = _delay_time_constrain(ret, self.laaso_min_delay, self.laaso_max_delay)
+        return ret
+
+    laaso_min_delay = LAASO_MIN_DELAY_DEFAULT
+    laaso_max_delay = LAASO_MAX_DELAY_DEFAULT
 
     @classmethod
     def add_to_obj(cls, obj, logger):
         '''
         Simulate obj inheriting from cls by explicitly inserting things that are not overloads
         '''
+        if not hasattr(obj, 'laaso_time_start'):
+            obj.laaso_time_start = time.time()
         obj._laaso_wrapped_operation = msapiwrap(logger, obj._operation) # pylint: disable=protected-access
         obj._laaso_time0 = time.time() # pylint: disable=protected-access
         obj.logger = logger
@@ -769,7 +982,12 @@ class LaaSO_ARMPolling_msrestazure(msrestazure.polling.arm_polling.ARMPolling):
             except AttributeError:
                 pass
         default = self._delay_time_from_header()
-        return _delay_time_for_polling(time0, default)
+        ret = _delay_time_for_polling(time0, default)
+        ret = _delay_time_constrain(ret, self.laaso_min_delay, self.laaso_max_delay)
+        return ret
+
+    laaso_min_delay = LAASO_MIN_DELAY_DEFAULT
+    laaso_max_delay = LAASO_MAX_DELAY_DEFAULT
 
     def _poll(self):
         '''
@@ -787,6 +1005,8 @@ class LaaSO_ARMPolling_msrestazure(msrestazure.polling.arm_polling.ARMPolling):
         '''
         Simulate obj inheriting from cls by explicitly inserting things that are not overloads
         '''
+        if not hasattr(obj, 'laaso_time_start'):
+            obj.laaso_time_start = time.time()
         obj._laaso_wrapped_operation = msapiwrap(logger, obj._operation) # pylint: disable=protected-access
         obj._laaso_wrapped_operation.logger = logger # pylint: disable=protected-access
         obj._laaso_time0 = time.time() # pylint: disable=protected-access
@@ -1024,6 +1244,11 @@ class AzLoginCredential(azure.identity._credentials.azure_cli.AzureCliCredential
     # (or whatever) without having the application terminate.
     LAASO_GET_TOKEN_MAX_SECONDS = 3600
 
+    # Serialize all calls to get_token() to work around
+    # problems scraping stdout. This goes away when we are
+    # no longer shelling out to az cli.
+    get_token_lock = threading.Lock()
+
     def get_token(self, *args, **kwargs):
         '''
         Wrap super-get_token() with retries.
@@ -1038,16 +1263,17 @@ class AzLoginCredential(azure.identity._credentials.azure_cli.AzureCliCredential
         calling az, so the best we can do is just keep hammering and hoping.
         '''
         logger = _logger_for_obj(self)
-        deadline = time.time() + self.LAASO_GET_TOKEN_MAX_SECONDS
-        while True:
-            try:
-                return super().get_token(*args, **kwargs)
-            except Exception as exc:
-                if time.time() >= deadline:
-                    logger.error("%s.%s giving up", type(self).__name__, getframename(0))
-                    raise
-                logger.warning("%s.%s did not succeed; will retry after %r", type(self).__name__, getframename(0), exc)
-                time.sleep(0.5)
+        with self.get_token_lock:
+            deadline = time.time() + self.LAASO_GET_TOKEN_MAX_SECONDS
+            while True:
+                try:
+                    return super().get_token(*args, **kwargs)
+                except Exception as exc:
+                    if time.time() >= deadline:
+                        logger.error("%s.%s giving up", type(self).__name__, getframename(0))
+                        raise
+                    logger.warning("%s.%s did not succeed; will retry after %r", type(self).__name__, getframename(0), exc)
+                    time.sleep(0.5)
 
 def methods_not_inherited_from(child_obj, parent_kls):
     '''
