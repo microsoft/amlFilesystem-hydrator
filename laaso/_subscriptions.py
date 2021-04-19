@@ -234,7 +234,6 @@ def subscription_info_get(subscription_id, return_default=True):
     '''
     if subscription_id == laaso.util.UUID_ZERO:
         return subscription_info_default_generate(laaso.util.UUID_ZERO)
-    subscription_id_effective = subscription_id
     subscription_id_effective = subscription_mapper.effective(subscription_id)
     for si in subscription_mapper.defaults:
         if si['subscription_id'].lower() == subscription_id_effective:

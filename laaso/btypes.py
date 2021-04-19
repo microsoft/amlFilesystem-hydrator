@@ -149,6 +149,13 @@ class LogTo(EnumMixin, enum.Enum):
     STDERR = 'stderr'
     STDOUT = 'stdout'
 
+class ShepherdPurpose(EnumMixin, enum.Enum):
+    '''
+    Why the shepherd is executing
+    '''
+    DEPLOY_CLUSTER = 'deploy_cluster'
+    NOT_SHEPHERD = 'not_shepherd'
+
 class StorageAccountType(EnumMixin, enum.Enum):
     '''
     Azure storage account types. Values here are the Azure-facing strings.

@@ -15,7 +15,6 @@ defaults:
   subscription_default: 22222222-2222-2222-2222-222222222222
   subscription_main: 22222222-2222-2222-2222-222222222222
   tenant_id_default: 44444444-4444-4444-4444-444444444444
-  vm_image_resource_group_default: image-rg
 service_endpoints_default:
 - service: Microsoft.AzureActiveDirectory
 - service: Microsoft.AzureCosmosDB

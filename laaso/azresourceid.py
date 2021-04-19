@@ -69,6 +69,7 @@ RE_IMAGE_NAME_ABS = re.compile(re_abs(RE_IMAGE_NAME_TXT))
 NETWORK_SECURITY_GROUP_NAME_LEN_MAX = 80
 RE_NETWORK_SECURITY_GROUP_NAME_TXT = r'(([a-zA-Z])|([a-zA-Z][a-zA-Z0-9_\.\-]{0,' + str(NETWORK_SECURITY_GROUP_NAME_LEN_MAX-2) + r'}[a-zA-Z_]))'
 
+# https://docs.microsoft.com/en-us/azure/azure-resource-manager/management/resource-name-rules#microsoftstorage
 RE_STORAGE_ACCOUNT_TXT = r'([a-z0-9]{3,24})'
 RE_STORAGE_ACCOUNT_ABS = re.compile(re_abs(RE_STORAGE_ACCOUNT_TXT))
 
@@ -286,6 +287,73 @@ class AzAnyResourceId():
             raise TypeError("other_id is %s; expected str" % type(other_id))
         return str(self).lower() == other_id.lower()
 
+class _ProviderNameMixin():
+    '''
+    Common provider_name properties
+    '''
+    @property
+    def provider_name(self):
+        '''
+        Getter
+        '''
+        return self._provider_name
+
+    @provider_name.setter
+    def provider_name(self, provider_name):
+        '''
+        Setter
+        '''
+        if not isinstance(provider_name, str):
+            raise TypeError("provider_name must be str, not %s" % type(provider_name).__name__)
+        if not provider_name:
+            raise self._exc_value('invalid provider_name')
+        self._provider_name = provider_name
+
+
+class _ResourceTypeMixin():
+    '''
+    Common resource_type properties
+    '''
+    @property
+    def resource_type(self):
+        '''
+        Getter
+        '''
+        return self._resource_type
+
+    @resource_type.setter
+    def resource_type(self, resource_type):
+        '''
+        Setter
+        '''
+        if not isinstance(resource_type, str):
+            raise TypeError("resource_type must be str, not %s" % type(resource_type).__name__)
+        if not resource_type:
+            raise self._exc_value('invalid resource_type (empty string)')
+        self._resource_type = resource_type
+
+class _ResourceNameMixin():
+    '''
+    Common resource_name properties
+    '''
+    @property
+    def resource_name(self):
+        '''
+        Getter
+        '''
+        return self._resource_name
+
+    @resource_name.setter
+    def resource_name(self, resource_name):
+        '''
+        Setter
+        '''
+        if not isinstance(resource_name, str):
+            raise TypeError("resource_name must be str, not %s" % type(resource_name).__name__)
+        if not resource_name:
+            raise self._exc_value('invalid resource_name')
+        self._resource_name = resource_name
+
 class AzProviderId(AzAnyResourceId):
     '''
     Example:
@@ -352,7 +420,7 @@ class AzProviderId(AzAnyResourceId):
         if provider_name:
             self.provider_name = provider_name
 
-class AzProviderResourceId(AzProviderId):
+class AzProviderResourceId(AzProviderId, _ProviderNameMixin, _ResourceTypeMixin):
     '''
     Example:
         /providers/Microsoft.Authorization/roleDefinitions/11111111-1111-1111-1111-111111111111
@@ -381,6 +449,13 @@ class AzProviderResourceId(AzProviderId):
                   **kwargs)
         ret.check_values_empty(values, exc_value=exc_value)
         return ret
+
+    @property
+    def arm_type(self) -> str:
+        '''
+        Return the corresponding type for this ARM resource ID
+        '''
+        return f"{self._provider_name}/{self._resource_type}"
 
     def fmt_vars(self):
         '''
@@ -545,7 +620,7 @@ class AzSubscriptionResourceId(AzAnyResourceId):
         self.subscription_id = uuid_normalize(self.subscription_id, key='subscription_id')
 
 @functools.total_ordering
-class AzSubscriptionProviderId(AzSubscriptionResourceId):
+class AzSubscriptionProviderId(AzSubscriptionResourceId, _ProviderNameMixin):
     '''
     Example:
       /subscriptions/11111111-1111-1111-1111-111111111111/providers/Microsoft.Authorization
@@ -571,24 +646,6 @@ class AzSubscriptionProviderId(AzSubscriptionResourceId):
                   **kwargs)
         ret.check_values_empty(values, exc_value=exc_value)
         return ret
-
-    @property
-    def provider_name(self):
-        '''
-        Getter
-        '''
-        return self._provider_name
-
-    @provider_name.setter
-    def provider_name(self, provider_name):
-        '''
-        Setter
-        '''
-        if not isinstance(provider_name, str):
-            raise TypeError("provider_name must be str, not %s" % type(provider_name).__name__)
-        if not provider_name:
-            raise self._exc_value('invalid provider_name')
-        self._provider_name = provider_name
 
     def fmt_vars(self):
         '''
@@ -645,7 +702,7 @@ class AzSubscriptionProviderId(AzSubscriptionResourceId):
             self.provider_name = provider_name
 
 @functools.total_ordering
-class AzSubscriptionProviderResourceId(AzSubscriptionProviderId):
+class AzSubscriptionProviderResourceId(AzSubscriptionProviderId, _ResourceTypeMixin, _ResourceNameMixin):
     '''
     Example:
       /subscriptions/11111111-1111-1111-1111-111111111111/providers/Microsoft.Authorization/roleDefinitions/22222222-2222-2222-2222-222222222222
@@ -678,40 +735,11 @@ class AzSubscriptionProviderResourceId(AzSubscriptionProviderId):
         return ret
 
     @property
-    def resource_type(self):
+    def arm_type(self) -> str:
         '''
-        Getter
+        Return the corresponding type for this ARM resource ID
         '''
-        return self._resource_type
-
-    @resource_type.setter
-    def resource_type(self, resource_type):
-        '''
-        Setter
-        '''
-        if not isinstance(resource_type, str):
-            raise TypeError("resource_type must be str, not %s" % type(resource_type).__name__)
-        if not resource_type:
-            raise self._exc_value('invalid resource_type (empty string)')
-        self._resource_type = resource_type
-
-    @property
-    def resource_name(self):
-        '''
-        Getter
-        '''
-        return self._resource_name
-
-    @resource_name.setter
-    def resource_name(self, resource_name):
-        '''
-        Setter
-        '''
-        if not isinstance(resource_name, str):
-            raise TypeError("resource_name must be str, not %s" % type(resource_name).__name__)
-        if not resource_name:
-            raise self._exc_value('invalid resource_name')
-        self._resource_name = resource_name
+        return f"{self._provider_name}/{self._resource_type}"
 
     def fmt_vars(self):
         '''
@@ -851,7 +879,7 @@ class AzRGResourceId(AzSubscriptionResourceId):
         return [toks[2], toks[4]]
 
 @functools.total_ordering
-class AzResourceId(AzRGResourceId):
+class AzResourceId(AzRGResourceId, _ProviderNameMixin, _ResourceTypeMixin, _ResourceNameMixin):
     '''
     Resource ID in Azure
     Examples:
@@ -889,58 +917,11 @@ class AzResourceId(AzRGResourceId):
         return ret
 
     @property
-    def provider_name(self):
+    def arm_type(self) -> str:
         '''
-        Getter
+        Return the corresponding type for this ARM resource ID
         '''
-        return self._provider_name
-
-    @provider_name.setter
-    def provider_name(self, provider_name):
-        '''
-        Setter
-        '''
-        if not isinstance(provider_name, str):
-            raise TypeError("provider_name must be str, not %s" % type(provider_name).__name__)
-        if not provider_name:
-            raise self._exc_value('invalid provider_name')
-        self._provider_name = provider_name
-
-    @property
-    def resource_type(self):
-        '''
-        Getter
-        '''
-        return self._resource_type
-
-    @resource_type.setter
-    def resource_type(self, resource_type):
-        '''
-        Setter
-        '''
-        if not isinstance(resource_type, str):
-            raise TypeError("resource_type must be str, not %s" % type(resource_type).__name__)
-        if not resource_type:
-            raise self._exc_value('invalid resource_type (empty string)')
-        self._resource_type = resource_type
-
-    @property
-    def resource_name(self):
-        '''
-        Getter
-        '''
-        return self._resource_name
-
-    @resource_name.setter
-    def resource_name(self, resource_name):
-        '''
-        Setter
-        '''
-        if not isinstance(resource_name, str):
-            raise TypeError("resource_name must be str, not %s" % type(resource_name).__name__)
-        if not resource_name:
-            raise self._exc_value('invalid resource_name')
-        self._resource_name = resource_name
+        return f"{self._provider_name}/{self._resource_type}"
 
     def fmt_vars(self):
         '''
@@ -1079,6 +1060,13 @@ class AzSubResourceId(AzResourceId):
             raise self._exc_value('invalid subresource_name')
         self._subresource_name = subresource_name
 
+    @property
+    def arm_type(self) -> str:
+        '''
+        Return the corresponding type for this ARM resource ID
+        '''
+        return f"{self._provider_name}/{self._resource_type}/{self._subresource_type}"
+
     def fmt_vars(self):
         '''
         Return a dict of vars suitable for str.format
@@ -1214,6 +1202,13 @@ class AzSub2ResourceId(AzSubResourceId):
         if not value:
             raise self._exc_value("invalid %s" % getframename(0))
         self._sub2resource_name = value
+
+    @property
+    def arm_type(self) -> str:
+        '''
+        Return the corresponding type for this ARM resource ID
+        '''
+        return f"{self._provider_name}/{self._resource_type}/{self._subresource_type}/{self._sub2resource_type}"
 
     def fmt_vars(self):
         '''
@@ -1419,13 +1414,29 @@ def azresourceid_normalize_subscription_only(val):
 ######################################################################
 # Specialized naming operations
 
+def resource_group_name_valid(name) -> bool:
+    '''
+    Return whether name is valid for a resource_group
+    '''
+    if not isinstance(name, str):
+        return False
+    return bool(RE_RESOURCE_GROUP_ABS.search(name))
+
+def image_gallery_name_valid(name) -> bool:
+    '''
+    Return whether name is valid for an image gallery
+    '''
+    if not isinstance(name, str):
+        return False
+    return bool(RE_GALLERY_NAME_ABS.search(name))
+
 KEY_VAULT_NAME_LEN_MIN = 3
 KEY_VAULT_NAME_LEN_MAX = 24
 # Matching this regexp is necessary but not sufficient. External
 # callers must use keyvault_name_valid().
 _RE_KEY_VAULT_NAME_ABS = re.compile(r'^[a-zA-Z][a-zA-Z0-9-]{1,22}[a-zA-Z0-9]$')
 
-def keyvault_name_valid(name):
+def keyvault_name_valid(name) -> bool:
     '''
     Return whether name is valid for a keyvault
     '''
@@ -1439,7 +1450,7 @@ def keyvault_name_valid(name):
         return False
     return True
 
-def keyvault_name_generate():
+def keyvault_name_generate() -> str:
     '''
     Generate a name to use for a keyvault.
     See https://docs.microsoft.com/en-us/azure/azure-resource-manager/management/resource-name-rules#microsoftkeyvault
@@ -1452,3 +1463,41 @@ def keyvault_name_generate():
         if not keyvault_name_valid(ret):
             continue
         return ret
+
+def storage_account_name_valid(name) -> bool:
+    '''
+    Return whether name is a valid storage account name
+    '''
+    if not isinstance(name, str):
+        return False
+    return bool(RE_STORAGE_ACCOUNT_ABS.search(name))
+
+def storage_account_name_generate():
+    '''
+    Generate a name to use for a storage account.
+    See https://docs.microsoft.com/en-us/azure/azure-resource-manager/management/resource-name-rules#microsoftstorage
+    '''
+    while True:
+        candidates = string.ascii_lowercase + string.digits
+        ret = ''.join([random.choice(candidates) for _ in range(random.randint(3, 24))]) # alphanumerics
+        if not storage_account_name_valid(ret):
+            continue
+        return ret
+
+# Not sufficient to determine whether or not it's a valid name.
+# External callers must use container_name_valid.
+_STORAGE_CN_RE = re.compile(r'^[a-z0-9][a-z0-9-]{2,62}$')
+
+def storage_container_name_valid(name) -> bool:
+    '''
+    Return whether name is valid for a blob container.
+    '''
+    return isinstance(name, str) and bool(_STORAGE_CN_RE.search(name)) and '--' not in name
+
+def subscription_id_valid(subscription_id):
+    '''
+    Return whether subscription_id is valid.
+    '''
+    if not isinstance(subscription_id, str):
+        return False
+    return bool(laaso.util.uuid_normalize(subscription_id, key='subscription_id', exc_value=None))

@@ -11,8 +11,10 @@ Support for locating filesystem contents
 Environment variables:
   LAASO_REPO_ROOT - use this as the effective root of the LaaSO repo
   LAASO_SUBSCRIPTION_CONFIG - location of the src/config/testing_subscriptions.yaml equivalent
+  LAASO_SUBSCRIPTION_NAME_SUBSTITUTIONS - override individual key/value pairs in toplevel subscription_name_substitutions dict
 '''
 import copy
+import json
 import os
 import sys
 import threading
@@ -35,6 +37,13 @@ import laaso.util
 # be running in a pipeline.
 _REPO_ROOT_SEARCH_PYTHONPATH = False
 
+# Set this environment variable to a JSON-serialized dict.
+# This dict is applied to subscription_name_substitutions
+# when subscription_config_data is loaded.
+# This is not applied to the cached contents to allow
+# resetting with new values.
+ENVIRON_SUBSCRIPTION_NAME_SUBSTITUTIONS = 'LAASO_SUBSCRIPTION_NAME_SUBSTITUTIONS'
+
 class Paths():
     '''
     Manage finding/caching paths.
@@ -50,6 +59,7 @@ class Paths():
     def reset(self, repo_root_path=None, subscription_config_filename='', subscription_config_data=None):
         '''
         Discard cached content. Useful for unit testing.
+        Intentionally skips _subscription_config_data_apply_environ().
         '''
         with self._repo_root_lock:
             self._repo_root_path = repo_root_path
@@ -220,6 +230,23 @@ class Paths():
             return venv
         return None
 
+    ANSIBLE_COLLECTIONS_PATHS_ONBOX = '/usr/laaso/venv/ansible-collections'
+
+    @property
+    def venv_ansible_collections(self):
+        '''
+        Getter for where to find ansible collections
+        '''
+        tmp = os.environ.get('ANSIBLE_COLLECTIONS_PATHS', '')
+        if tmp:
+            return tmp
+        if laaso.onbox.ONBOX:
+            return self.ANSIBLE_COLLECTIONS_PATHS_ONBOX
+        venv = self.venv
+        if venv:
+            return os.path.join(venv, 'ansible-collections')
+        return None
+
     ######################################################################
     # subscription_config_filename
 
@@ -335,21 +362,43 @@ class Paths():
                 if data is None:
                     # empty file - interpret it as an empty dict
                     data = dict()
+                if not isinstance(data, dict):
+                    raise ApplicationExit(f"content of subscription config file {self.subscription_config_filename!r} is not a dict")
                 self._scd_cache[self.subscription_config_filename] = data
             # Always force a copy so that the cache never shares a ref with what we use here
             data = copy.deepcopy(data)
+            self._subscription_config_data_apply_environ(data, self.subscription_config_filename)
             self._subscription_config_data_set(data)
             return self._subscription_config_data
 
-    def _subscription_config_data_set(self, data):
+    @staticmethod
+    def _subscription_config_data_apply_environ(data:dict, filename:str):
+        '''
+        Apply environment settings to data that is about to become subscription_config_data.
+        The caller has already deepcopied data, so we may freely modify it in-place.
+        '''
+        subscription_name_substitutions = os.environ.get(ENVIRON_SUBSCRIPTION_NAME_SUBSTITUTIONS, '{}')
+        try:
+            subscription_name_substitutions = json.loads(subscription_name_substitutions)
+        except json.decoder.JSONDecodeError as exc:
+            raise ApplicationExit(f"cannot parse {ENVIRON_SUBSCRIPTION_NAME_SUBSTITUTIONS}: {exc!r}") from exc
+        if not (isinstance(subscription_name_substitutions, dict) and all(isinstance(key, str) for key in subscription_name_substitutions.keys())):
+            raise ApplicationExit(f"invalid {ENVIRON_SUBSCRIPTION_NAME_SUBSTITUTIONS}")
+        data_sns = data.setdefault('subscription_name_substitutions', dict())
+        if not (isinstance(data_sns, dict) and all(isinstance(key, str) for key in data_sns.keys())):
+            raise ApplicationExit(f"cannot parse {filename}: invalid subscription_name_substitutions")
+        data_sns.update(subscription_name_substitutions)
+        if not data_sns:
+            data.pop('subscription_name_substitutions')
+
+    def _subscription_config_data_set(self, data:dict):
         '''
         Use the provided data as the subscription config.
         Caller holds self._repo_root_lock.
         '''
+        assert isinstance(data, dict)
         with self._repo_root_lock:
             assert self._subscription_config_path
-            if not isinstance(data, dict):
-                raise ApplicationExit("content of subscription config file %r is not a dict" % self.subscription_config_filename)
             self._subscription_config_data = data
 
     ######################################################################
@@ -405,6 +454,21 @@ class Paths():
         Getter: path for ansible-playbook
         '''
         return self.exe_effective('ansible-playbook')
+
+    ######################################################################
+    # other paths
+
+    CLUSTER_SKUS_DIR_ONBOX = '/usr/laaso/lib/amlfilesystem_skus'
+    CLUSTER_SKUS_TUPLE_REPO = ('src', 'deploy_config', 'skus')
+
+    @property
+    def cluster_skus_dir(self) -> str:
+        '''
+        Path of directory containing cluster SKUs
+        '''
+        if laaso.onbox.ONBOX:
+            return self.CLUSTER_SKUS_DIR_ONBOX
+        return self.repo_root_path(*self.CLUSTER_SKUS_TUPLE_REPO)
 
     ######################################################################
     # helpers
@@ -469,7 +533,7 @@ class Paths():
         '''
         subscriptions = self.subscription_config_list_from_default_data('subscriptions')
         # explicitly generate a list and return a tuple to avoid returning a generator
-        return tuple([x.get('subscription_id', '') for x in subscriptions if x])
+        return tuple(x.get('subscription_id', '') for x in subscriptions if x)
 
     def subscription_config_data_for_one_subscription(self, subscription_id, exc_value=EXC_VALUE_DEFAULT) -> dict:
         '''

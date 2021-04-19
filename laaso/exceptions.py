@@ -154,6 +154,12 @@ class ContainerNameInvalidException(ValueError):
     '''
     # no specialization here
 
+class QueueNameInvalidException(ValueError):
+    '''
+    queue_name is not valid
+    '''
+    # no specialization here
+
 class DevUserUnknownException(ApplicationException):
     '''
     Dev user name is unrecognized. See laaso.dev_users.DevUser.dev_user_get().

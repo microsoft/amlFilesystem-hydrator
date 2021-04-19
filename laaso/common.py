@@ -16,6 +16,7 @@ import getpass
 import inspect
 import json
 import logging
+import logging.handlers
 import multiprocessing
 import os
 import pathlib
@@ -26,6 +27,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import syslog
 import tempfile
 import threading
 import time
@@ -59,7 +61,6 @@ from laaso.util import (ArgExplicit,
                         Parallel,
                         cmd_str,
                         elapsed,
-                        execute_logged,
                         expand_item_pformat,
                         getframename,
                         indent_exc,
@@ -189,6 +190,10 @@ class Application():
 
     LOG_LEVEL_CHOICES = ('debug', 'info', 'warning', 'error', 'critical')
 
+    SYSLOG_IDENT = ''
+    SYSLOG_FACILITY = syslog.LOG_USER
+    SYSLOG_OPTIONS = syslog.LOG_PID
+
     @property
     def logger(self):
         '''
@@ -233,31 +238,6 @@ class Application():
                 prev = logger_name
         return '.'.join(nc)
 
-    @staticmethod
-    def log_level_get(log_level):
-        '''
-        Given a log_level, attempt to translate it to an integer log level.
-        '''
-        if isinstance(log_level, int):
-            return log_level
-        tmpstr = str(log_level)
-        try:
-            return int(tmpstr)
-        except ValueError:
-            pass
-        for tmp in [tmpstr, tmpstr.upper()]:
-            try:
-                return int(logging._nameToLevel[tmp]) # pylint: disable=protected-access
-            except (AttributeError, KeyError, ValueError):
-                pass
-            try:
-                val = getattr(logging, tmp)
-                if isinstance(val, int):
-                    return val
-            except (AttributeError, KeyError, ValueError):
-                pass
-        raise ValueError("cannot interpret %s '%s' as a log level" % (log_level.__class__.__name__, log_level))
-
     def _app_logger_create(self, **kwargs):
         '''
         Create the logger iff necessary
@@ -300,18 +280,19 @@ class Application():
             logging.basicConfig(format=log_fmt, filename=log_file)
         else:
             logging.basicConfig(format=log_fmt, stream=stream)
-        log_level = cls.log_level_get(log_level if log_level is not None else cls.LOG_LEVEL_DEFAULT)
+        log_level = laaso.util.log_level_normalize(log_level if log_level is not None else cls.LOG_LEVEL_DEFAULT)
         if cls.LOG_LEVEL_PYTEST:
-            log_level = min(cls.log_level_get(cls.LOG_LEVEL_PYTEST), log_level)
+            log_level = min(laaso.util.log_level_normalize(cls.LOG_LEVEL_PYTEST), log_level)
         if logger is not None:
             return log_level, logger
         logger = logging.getLogger(name=cls.LOGGER_NAME)
-        cls._logging_suppress() # Do this after getting our logger so we've created at least one non-root logger before this one
+        cls._logger_add_syslog_handler(logger)
+        cls._logging_adjust_other_loggers() # Do this after getting our logger so we've created at least one non-root logger before this one
         logger.setLevel(log_level)
         return log_level, logger
 
     @classmethod
-    def _logging_suppress(cls):
+    def _logging_adjust_other_loggers(cls):
         '''
         Adjust log levels in known-noisy loggers. Azure SDKs, I'm looking at you.
         '''
@@ -358,6 +339,7 @@ class Application():
         new_logger.setLevel(log_level)
         new_logger.propagate = False
         new_logger.addHandler(handler)
+        self._logger_add_syslog_handler(logger)
         # find any pytest handlers and duplicate them on this logger.
         # pytest does not see a non-propagating logger created during a test.
         # Future-proofing: does not add the same handler more than once,
@@ -667,11 +649,43 @@ class Application():
         laaso.output.capture()
 
     @classmethod
+    def _logger_add_syslog_handler(cls, logger):
+        '''
+        Add a SysLogHandler to the given logger iff one is not already present
+        '''
+        if laaso.ONBOX:
+            with syslog_state.syslog_lock:
+                # Check to see if we already have a SysLogHandler
+                for handler in logger.handlers:
+                    if isinstance(handler, logging.handlers.SysLogHandler):
+                        return
+                handler = syslog_state.syslog_handler_generate()
+                if handler:
+                    logger.addHandler(handler)
+
+    @classmethod
+    def _syslog_openlog(cls):
+        '''
+        This is invoked first thing from cls.main().
+        This does the openlog using the parameters SYSLOG_IDENT, SYSLOG_FACILITY, and SYSLOG_OPTIONS
+        from the calling class.
+        The default definition of SYSLOG_IDENT is the empty string.
+        If the class for which main() is invoked does not overload
+        SYSLOG_IDENT to something non-empty, this operation marks the
+        openlog complete without doing anything.
+        '''
+        if laaso.ONBOX and cls.SYSLOG_IDENT:
+            syslog_state.initialize(cls.SYSLOG_IDENT, cls.SYSLOG_FACILITY, cls.SYSLOG_OPTIONS)
+        else:
+            syslog_state.initialize('', None, None)
+
+    @classmethod
     def main(cls, name):
         '''
         Entrypoint as from the command-line.
         '''
         if name == '__main__':
+            cls._syslog_openlog()
             cls.main_with_args(sys.argv[1:])
             raise SystemExit(1)
 
@@ -1004,14 +1018,14 @@ class Application():
 
     def cmd_simple(self, command, **kwargs):
         '''
-        Execute a command using execute_logged().
+        Execute a command using laaso.util.execute_logged().
         Raise CommandFailed on failure.
         Raise CommandTimeout on timeout.
         '''
         if isinstance(command, str):
             command = shlex.split(command)
         env = kwargs.pop('env', None)
-        exit_status = execute_logged(command, self.logger, env=env, **kwargs)
+        exit_status = laaso.util.execute_logged(command, self.logger, env=env, **kwargs)
         if exit_status:
             raise CommandFailed(exit_status, command, env)
 
@@ -1158,6 +1172,9 @@ class Application():
         if kwargs.pop('check', True):
             self.ansible_cfg_check()
         ret = {'ANSIBLE_CONFIG' : self.ansible_cfg}
+        if laaso.paths.venv_ansible_collections and os.path.isdir(laaso.paths.venv_ansible_collections):
+            ret['ANSIBLE_COLLECTIONS_PATH'] = laaso.paths.venv_ansible_collections
+            ret['ANSIBLE_COLLECTIONS_PATHS'] = laaso.paths.venv_ansible_collections
         if self.username and (self.username != getpass.getuser()):
             kwargs['ANSIBLE_REMOTE_USER'] = self.username
         ret.update(kwargs)
@@ -1214,7 +1231,7 @@ class Application():
 
     def _logfilter_playbook_run(self, txt):
         '''
-        This is passed as the logfilter to execute_logged() when we run a playbook.
+        This is passed as the logfilter to _ansible_execute_logged() when we run a playbook.
         '''
         if not txt.strip():
             return None
@@ -1317,9 +1334,9 @@ class Application():
         if not os.path.isfile(playbook_path):
             try:
                 ap = os.path.abspath(playbook_path)
-                self.logger.error("%s does not exist or is not a file; abspath=%r", playbook_path, ap)
+                logger.error("%s does not exist or is not a file; abspath=%r", playbook_path, ap)
             except Exception as exc:
-                self.logger.error("%s does not exist or is not a file; cannot determine abspath: %r", playbook_path, exc)
+                logger.error("%s does not exist or is not a file; cannot determine abspath: %r", playbook_path, exc)
             raise ValueError("%s does not exist or is not a file" % playbook_path)
 
         inventory_str = self.ansible_inventory_xlat(inventory)
@@ -1349,7 +1366,7 @@ class Application():
             cmd.extend(['-v'] * verbosity)
         logger.log(log_level, "run: %s", cmd_str(cmd, env))
         try:
-            exit_status = execute_logged(cmd, env=self.ansible_env_inherit(env), logger=self.logger, log_level=log_level, **kwargs)
+            exit_status = _ansible_execute_logged(cmd, logger, env=self.ansible_env_inherit(env), log_level=log_level, **kwargs)
         except CommandFailed as exc:
             logger.error("command failed: %s", cmd_str(cmd, env))
             if suggest_repro:
@@ -1455,24 +1472,34 @@ class Application():
             raise ApplicationExit(1)
         return todo
 
-    @staticmethod
-    def ansible_lint_exe():
+    LAASO_ANSIBLE_LINT_ONBOX = '/usr/laaso/bin/laaso_ansible_lint.py'
+
+    @classmethod
+    def ansible_lint_exe(cls):
         '''
         Return the name of the ansible-lint executable
         '''
         if laaso.ONBOX:
-            return os.path.join(laaso.base_defaults.LAASO_VENV_PATH, 'bin', 'ansible-lint')
-        return 'ansible-lint'
+            return cls.LAASO_ANSIBLE_LINT_ONBOX
+        return laaso.paths.repo_root_path('src', 'ansible', 'bin', 'laaso_ansible_lint.py')
 
     def _ansible_run_lint_one(self, filename):
         '''
         Lint one file
         '''
+        def logfilter(line):
+            '''
+            Return whether or not to log the given line
+            '''
+            if line.startswith('Added ANSIBLE_COLLECTIONS_PATHS'):
+                return None
+            return line
+
         cmd = [self.ansible_lint_exe(), filename]
         ansible_env = self.ansible_env()
         self.logger.debug("run: %s", cmd_str(cmd, ansible_env))
         try:
-            exit_status = execute_logged(cmd, env=self.ansible_env_inherit(ansible_env), logger=self.logger)
+            exit_status = _ansible_execute_logged(cmd, self.logger, env=self.ansible_env_inherit(ansible_env), logfilter=logfilter)
         except Exception as exc:
             self.logger.error("command failed (%r): %s", exc, cmd_str(cmd, ansible_env))
             raise ApplicationExit(1) from exc
@@ -1608,6 +1635,7 @@ class Application():
             raise ValueError("invalid subscription_id")
         if len(args) not in (0, 1):
             raise TypeError("%s.%s expected at most 2 arguments, got %d" % (type(self).__name__, getframename(0), len(args)))
+        subscription_id = laaso.subscription_mapper.effective(subscription_id)
         for s in laaso.subscription_mapper.defaults:
             if s['subscription_id'] == subscription_id:
                 try:
@@ -1903,12 +1931,74 @@ class Application():
         exval_sub(ret, 'omsWorkspaceIdDefault')
         return ret
 
+def _ansible_execute_logged(cmd:list, logger:logging.Logger, **kwargs):
+    '''
+    Wrap execute_logged(). This method provides an intercept point for unit tests.
+    '''
+    return laaso.util.execute_logged(cmd, logger, **kwargs)
+
+class _SyslogState():
+    '''
+    Singleton class - global syslog state
+    '''
+    _syslog_lock = threading.RLock()
+    _syslog_initialized = False
+    _syslog_ident = None
+    _syslog_facility = None
+    _syslog_options = None
+
+    @property
+    def syslog_lock(self):
+        '''
+        Getter - global lock for syslog state
+        '''
+        return self._syslog_lock
+
+    @classmethod
+    def initialize(cls, ident, facility, options):
+        '''
+        Initialize global state
+        '''
+        with cls._syslog_lock:
+            if not cls._syslog_initialized:
+                assert cls._syslog_ident is None
+                assert cls._syslog_facility is None
+                assert cls._syslog_options is None
+
+                cls._syslog_ident = ident
+                cls._syslog_facility = facility
+                cls._syslog_options = options
+
+                if cls._syslog_ident:
+                    syslog.closelog()
+                    syslog.openlog(cls._syslog_ident, cls._syslog_facility, cls._syslog_options)
+                    syslog.setlogmask(syslog.LOG_UPTO(syslog.LOG_INFO))
+
+            cls._syslog_initialized = True
+
+    @classmethod
+    def syslog_handler_generate(cls) -> logging.handlers.SysLogHandler:
+        '''
+        Generate and return a logging.handlers.SysLogHandler
+        using the common syslog configuration.
+        '''
+        with cls._syslog_lock:
+            cls.initialize('', None, None)
+            if cls._syslog_ident:
+                assert cls._syslog_facility is not None
+                assert cls._syslog_options is not None
+                handler = logging.handlers.SysLogHandler(address='/dev/log', facility=cls._syslog_facility)
+                handler.ident = f"{cls._syslog_ident}[{os.getpid()}]: "
+                return handler
+        return None
+
+syslog_state = _SyslogState()
+
 class ApplicationWithSubscription(Application):
     '''
     Application that operates on a subscription
     '''
     def __init__(self, subscription_id=None, tenant_id=None, **kwargs):
-        super().__init__(**kwargs)
         if subscription_id == 'default':
             # JIT translate this so we can have 'default' as a command-line
             # default to avoid translating subscription IDs before construction.
@@ -1920,6 +2010,11 @@ class ApplicationWithSubscription(Application):
         self.tenant_id = getattr(self, 'tenant_id', '') or tenant_id or laaso.scfg.tenant_id_default
 
         self.subscription_id_set(use_subscription_id)
+
+        # We set the subscription id before we initialize the Application class.
+        # This allows the logblob logging initialization to access the subscription id,
+        # and can therefore be subscription-specific.
+        super().__init__(**kwargs)
 
     @property
     def subscription_id(self):

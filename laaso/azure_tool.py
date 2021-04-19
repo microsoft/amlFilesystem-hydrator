@@ -11,17 +11,17 @@ Scripted management for laaso server VMs for testing
 import base64
 import configparser
 import copy
+import datetime
 import enum
+import functools
 import http.client
 import inspect
 import io
 import json
 import logging
 import os
-import pprint
 import random
 import re
-import sys
 import threading
 import time
 import traceback
@@ -48,33 +48,33 @@ from azure.mgmt.authorization import AuthorizationManagementClient
 import azure.mgmt.authorization.models
 import azure.mgmt.authorization.v2018_01_01_preview.models
 from azure.mgmt.compute import ComputeManagementClient
-from azure.mgmt.compute.models import ResourceIdentityType
+import azure.mgmt.compute.models
 from azure.mgmt.keyvault import KeyVaultManagementClient
 from azure.mgmt.loganalytics import LogAnalyticsManagementClient
 from azure.mgmt.msi import ManagedServiceIdentityClient
 from azure.mgmt.network import NetworkManagementClient
+import azure.mgmt.network.models
 from azure.mgmt.resource import ResourceManagementClient
 import azure.mgmt.resource.resources.models
-from azure.mgmt.resourcegraph import ResourceGraphClient
+import azure.mgmt.storage
 from azure.mgmt.storage import StorageManagementClient
+from azure.mgmt.storage.models import StorageAccountCreateParameters
+import azure.mgmt.subscription
 from azure.mgmt.subscription import SubscriptionClient
 import azure.storage.blob
 from azure.storage.blob import (BlobClient,
-                                BlobServiceClient,
-                                BlobType,
                                 ContainerClient,
                                )
 from azure.storage.filedatalake import (DataLakeDirectoryClient,
                                         DataLakeServiceClient,
                                         FileSystemClient,
                                        )
-import azure.mgmt.subscription
+from azure.storage.queue import QueueClient
 import cryptography.hazmat.primitives.serialization
 import cryptography.hazmat.primitives.serialization.pkcs12
 import knack.util
 import msrest
 import msrest.service_client
-import msrestazure.polling.arm_polling
 import requests
 import urllib3
 
@@ -82,24 +82,23 @@ import laaso
 import laaso.azresourceid
 from laaso.azresourceid import (AzAnyResourceId,
                                 AzProviderResourceId,
+                                AzRGResourceId,
                                 AzResourceId,
                                 AzSub2ResourceId,
                                 AzSubResourceId,
                                 AzSubscriptionProviderResourceId,
                                 AzSubscriptionResourceId,
-                                RE_GALLERY_NAME_ABS,
-                                RE_RESOURCE_GROUP_ABS,
                                 azresourceid_from_text,
                                 azresourceid_or_none_from_text,
                                 azrid_is,
                                 azrid_normalize,
                                 azrid_normalize_or_none,
+                                subscription_id_valid,
                                )
 import laaso.base_defaults
 from laaso.base_defaults import EXC_VALUE_DEFAULT
 from laaso.btypes import (EnumMixin,
                           ReadOnlyDict,
-                          VM_OS_DISK_STORAGE_ACCOUNT_TYPE_DEFAULT,
                          )
 from laaso.cacher import CacheIndexer
 import laaso.clouds
@@ -115,6 +114,7 @@ from laaso.exceptions import (ApplicationException,
 import laaso.identity
 import laaso.msapicall
 from laaso.msapicall import (armpolling_obj_for_operations,
+                             laaso_lro_wait,
                              msapicall,
                              msapiwrap,
                             )
@@ -122,13 +122,12 @@ from laaso.semantic_version import SemanticVersion
 from laaso.output import output_redact
 from laaso.storagenaming import (BlobName,
                                  ContainerName,
+                                 QueueName,
                                  StorageAccountName,
                                 )
 import laaso.util
 from laaso.util import (PF,
                         RE_UUID_ABS,
-                        RE_UUID_RE,
-                        elapsed,
                         expand_item,
                         expand_item_pformat,
                         getframe,
@@ -191,6 +190,17 @@ REST_API_VERSIONS = ReadOnlyDict({'metadata_service' : '2020-06-01', # https://d
 API_VERSIONS_DEFAULT = ((AuthorizationManagementClient, '2018-01-01-preview'),
                        )
 
+# A nonempty tag with this name tells Manager.resource_group_delete()
+# that it should not delete this resource_group. This may be
+# bypassed by using an external mechanism such as az cli or the portal.
+# The intent here is to avoid using resource_group_delete.py to delete
+# a bunch of RGs that should be kep around.
+RG_KEEP_TAG_KEY = 'keep'
+
+# Unit tests replace these
+BLOB_SERVICE_CLIENT = azure.storage.blob.BlobServiceClient
+QUEUE_SERVICE_CLIENT = azure.storage.queue.QueueServiceClient
+
 class AzCred(EnumMixin, enum.Enum):
     '''
     Magic values that may be placed in a client_id list to indicate
@@ -199,6 +209,15 @@ class AzCred(EnumMixin, enum.Enum):
     '''
     LOGIN = 'login'
     SYSTEM_ASSIGNED = 'system-assigned'
+
+class CWSkipTransform(ApplicationException):
+    '''
+    This exception is used by call wrappers such as _cw_list()
+    that can optionally transform a result. This is raised by
+    the transform operation to indicate that the item must
+    be entirely elided from the result list.
+    '''
+    # No specialization
 
 class ToolException(ApplicationException):
     '''
@@ -358,108 +377,73 @@ def _unhandled_sku(sku, logger, extra=''):
 
 command = Command()
 
-class VMDesc():
+class StorageOpBundle():
     '''
-    Describe a VM
-    '''
-    def __init__(self, name, vm_size, nic_name=None, accelerated_networking=None, custom_data=None, public_ip_id=None, admin_username=None):
-        self.vm_name = name
-        self.vm_size = vm_size
-        self.accelerated_networking = accelerated_networking
-        self.custom_data = custom_data
-        self.public_ip_id = public_ip_id or None
-        self.admin_username = admin_username or None
-
-        if nic_name:
-            self.nic_name = nic_name
-            self.nic_name_provided = True
-        else:
-            self.nic_name = self.vm_name + '-nic'
-            self.nic_name_provided = False
-
-        self.boot_diag_enable = True
-        self.boot_diag_use_storage_account_iff_available = True
-
-        self.vm_create_op = None
-        self.vm_create_res = None
-        self.osdisk_name = self.vm_name + '-osdisk'
-        self.nic_create_op = None
-        self.nic_obj = None
-        self.nic_private_ip = None
-
-    def __repr__(self):
-        return "%s(%r, %r, accelerated_networking=%r)" % (type(self).__name__, self.vm_name, self.vm_size, self.accelerated_networking)
-
-    def nic_create_op_wait(self, logger):
-        '''
-        Wait for self.nic_create_op to complete
-        '''
-        if self.nic_create_op and (not self.nic_obj):
-            logger.info("NIC create %s wait", self.nic_name)
-            self.nic_create_op.wait()
-            self.nic_obj = self.nic_create_op.result()
-        self.nic_private_ip = self.nic_obj.ip_configurations[0].private_ip_address
-        logger.info("NIC create %s result:\n%s", self.nic_name, expand_item_pformat(self.nic_obj))
-
-    def log_ip_str(self):
-        '''
-        String used by log_ip()
-        '''
-        return "%s %s" % (self.vm_name, self.nic_private_ip)
-
-class BlobOpBundle():
-    '''
-    Container of stuff useful for operating on a blob
+    Container of stuff useful for operating on blobs and queues.
     '''
     def __init__(self,
                  name,
+                 logger=None,
                  manager=None,
                  subscription_id=None,
                  storage_account_resource_group_name=None,
-                 blobserviceclient=None,
-                 containerclient=None,
-                 blobclient=None,
-                 datalakeserviceclient=None,
-                 filesystemclient=None,
-                 directoryclient=None,
                  storage_account_key=None,
                  sas_token=None,
-                 credential=None,
+                 credential_explicit=None,
+                 credential_implicit=None,
                  warn_missing=True):
         '''
         manager is a hint; it is not used if the subscription_id does not match
         '''
         self._name = self.name_normalize(name, subscription_id=subscription_id)
         self._manager = manager_for(self._name, manager=manager, update_thing=True)
+        self.logger = logger or self._manager.logger
         self.storage_account_resource_group_name = storage_account_resource_group_name or None
-        self._lock = threading.RLock()
-        self._blobserviceclient = blobserviceclient
-        self._containerclient = containerclient
-        self._blobclient = blobclient
-        self._datalakeserviceclient = None
-        self._filesystemclient = None
-        self._directoryclient = None
         self._storage_account_key = storage_account_key
         self._sas_token = sas_token
-        self._credential = credential
+        self.sb_credential_explicit = credential_explicit
+        self.sb_credential_implicit = credential_implicit
         self.warn_missing = warn_missing
-        self._hns_enabled = None
 
-        if not isinstance(self._blobserviceclient, (type(None), BlobServiceClient)):
+        self._hns_enabled = None
+        self._lock = threading.RLock()
+
+        self.discard_cached_clients()
+
+        if not isinstance(self._blobserviceclient, (type(None), BLOB_SERVICE_CLIENT)):
             raise TypeError("bad blobserviceclient type %s" % type(self._blobserviceclient))
+        if not isinstance(self._queueserviceclient, (type(None), QUEUE_SERVICE_CLIENT)):
+            raise TypeError("bad queueserviceclient type %s" % type(self._queueserviceclient))
         if not isinstance(self._containerclient, (type(None), ContainerClient)):
             raise TypeError("bad containerclient type %s" % type(self._containerclient))
+        if not isinstance(self._queueclient, (type(None), QueueClient)):
+            raise TypeError("bad queueclient type %s" % type(self._queueclient))
         if not isinstance(self._blobclient, (type(None), BlobClient)):
             raise TypeError("bad blobclient type %s" % type(self._blobclient))
 
-        self.datalakeserviceclient = datalakeserviceclient
-        self.filesystemclient = filesystemclient
-        self.directoryclient = directoryclient
+    def discard_cached_clients(self):
+        '''
+        Discard any previously cached clients.
+        '''
+        with self._lock:
+            self._blobserviceclient = None
+            self._datalakeserviceclient = None
+            self._queueserviceclient = None
 
-        if not isinstance(self._name, BlobClient):
-            assert self._blobclient is None
-        if not isinstance(self._name, ContainerClient):
-            assert self._containerclient is None
+            self._blobclient = None
+            self._containerclient = None
+            self._directoryclient = None
+            self._filesystemclient = None
+            self._queueclient = None
+
+    @property
+    def sb_credential_preferred(self):
+        '''
+        Getter for "best" credential
+        '''
+        if self.sb_credential_explicit is not None:
+            return self.sb_credential_explicit
+        return self._sas_token or self._storage_account_key or self.sb_credential_implicit
 
     @property
     def cloud(self):
@@ -476,9 +460,9 @@ class BlobOpBundle():
         return self._name
 
     @staticmethod
-    def name_normalize(name, subscription_id=None, subscription_id_default=None):
+    def name_normalize(name, subscription_id=None, subscription_id_default=None, prefer_queue_name=False):
         '''
-        Given a name, convert it to the most precise of BlobName/ContainerName/StorageAccountName.
+        Given a name, convert it to the most precise of BlobName/ContainerName/QueueName/StorageAccountName.
         '''
         if isinstance(name, StorageAccountName):
             tmp = name.subscription_id
@@ -500,10 +484,16 @@ class BlobOpBundle():
         except (TypeError, ValueError):
             pass
         if ret is None:
-            try:
-                ret = ContainerName(name, subscription_id=subscription_id)
-            except (TypeError, ValueError):
-                pass
+            if prefer_queue_name or isinstance(name, QueueName):
+                try:
+                    ret = QueueName(name, subscription_id=subscription_id)
+                except (TypeError, ValueError):
+                    pass
+            else:
+                try:
+                    ret = ContainerName(name, subscription_id=subscription_id)
+                except (TypeError, ValueError):
+                    pass
         if ret is None:
             try:
                 ret = StorageAccountName(name, subscription_id=subscription_id)
@@ -524,16 +514,9 @@ class BlobOpBundle():
         return "%s.%s" % (cls.__name__, getframename(1))
 
     @property
-    def logger(self):
-        '''
-        Getter for a logger
-        '''
-        return self._manager.logger
-
-    @property
     def blobserviceclient(self):
         '''
-        Return BlobServiceClient, creating iff necessary
+        Return BLOB_SERVICE_CLIENT, creating iff necessary
         '''
         with self._lock:
             if not self._blobserviceclient:
@@ -545,10 +528,30 @@ class BlobOpBundle():
         '''
         Use value as self.blobserviceclient
         '''
-        if not isinstance(value, (type(None), BlobServiceClient)):
+        if not isinstance(value, (type(None), BLOB_SERVICE_CLIENT)):
             raise TypeError("unexpected type %s" % type(value))
         with self._lock:
             self._blobserviceclient = value
+
+    @property
+    def queueserviceclient(self):
+        '''
+        Return QUEUE_SERVICE_CLIENT, creating iff necessary
+        '''
+        with self._lock:
+            if not self._queueserviceclient:
+                self.populate_queueserviceclient()
+            return self._queueserviceclient
+
+    @queueserviceclient.setter
+    def queueserviceclient(self, value):
+        '''
+        Use value as self.queueserviceclient
+        '''
+        if not isinstance(value, (type(None), QUEUE_SERVICE_CLIENT)):
+            raise TypeError("unexpected type %s" % type(value))
+        with self._lock:
+            self._queueserviceclient = value
 
     @property
     def containerclient(self):
@@ -570,6 +573,28 @@ class BlobOpBundle():
         assert isinstance(self._name, ContainerName)
         with self._lock:
             self._containerclient = value
+
+    @property
+    def queueclient(self):
+        '''
+        Return QueueClient, creating iff necessary
+        '''
+        with self._lock:
+            if not self._queueclient:
+                self.populate_queueclient()
+            return self._queueclient
+
+    @queueclient.setter
+    def queueclient(self, value):
+        '''
+        Use value as self.queueclient
+        '''
+        if not isinstance(value, (type(None), QueueClient)):
+            raise TypeError("unexpected type %s" % type(value))
+        if value:
+            assert isinstance(self._name, QueueName)
+        with self._lock:
+            self._queueclient = value
 
     @property
     def blobclient(self):
@@ -671,30 +696,52 @@ class BlobOpBundle():
             if (not self.storage_account_resource_group_name) and self.warn_missing:
                 self.logger.warning("%s.%s cannot get storage_account_resource_group_name for %r", type(self).__name__, getframe(0), self._name)
 
+    def populate_storage_account_key_iff_necessary(self):
+        '''
+        Generate and remember storage_account_key if and only if we do not already have it
+        '''
+        with self._lock:
+            if self._storage_account_key is None:
+                self.populate_storage_account_key()
+
     def populate_storage_account_key(self):
         '''
         Generate and remember storage_account_key
         '''
         with self._lock:
-            # storage_account_keys_get will fetch storage_account_resource_group_name if it is not provided.
-            # may as well fetch and cache it here.
-            if not self.storage_account_resource_group_name:
-                self.populate_storage_account_resource_group_name()
-            key = None
-            keys = self._manager.storage_account_keys_get(storage_account_name=self._name.storage_account_name, storage_account_resource_group_name=self.storage_account_resource_group_name)
-            if keys:
-                for idx, k in enumerate(keys):
-                    if k:
-                        keyname = "storage_account_key[%s][%d]" % (self._name.storage_account_name, idx)
-                        output_redact(keyname, k)
-                        if not key:
-                            key = k
-                if not key:
-                    if self.warn_missing:
-                        self.logger.warning("%s.%s storage_account_keys_get did not return a valid key for %r", type(self).__name__, getframe(0), self._name)
-            self._storage_account_key = key
-            if (not self._storage_account_key) and self.warn_missing:
-                self.logger.warning("%s.%s cannot get storage_account_keys for %r", type(self).__name__, getframe(0), self._name)
+            val_prev = self.sb_credential_preferred
+            try:
+                # storage_account_keys_get will fetch storage_account_resource_group_name if it is not provided.
+                # may as well fetch and cache it here.
+                if not self.storage_account_resource_group_name:
+                    self.populate_storage_account_resource_group_name()
+                key = None
+                try:
+                    keys = self._manager.storage_account_keys_get(storage_account_name=self._name.storage_account_name, storage_account_resource_group_name=self.storage_account_resource_group_name)
+                except Exception as exc:
+                    caught = laaso.msapicall.Caught(exc)
+                    if caught.status_code == http.client.FORBIDDEN:
+                        keys = None
+                    else:
+                        raise
+                if keys:
+                    for idx, k in enumerate(keys):
+                        if k:
+                            keyname = "storage_account_key[%s][%d]" % (self._name.storage_account_name, idx)
+                            output_redact(keyname, k)
+                            if not key:
+                                key = k
+                    if not key:
+                        if self.warn_missing:
+                            self.logger.warning("%s: storage_account_keys_get did not return a valid key for %r", self.mth(), self._name)
+                self._storage_account_key = key
+                if (not self._storage_account_key) and self.warn_missing:
+                    self.logger.warning("%s: cannot get storage_account_keys for %r", self.mth(), self._name)
+            finally:
+                if id(self.sb_credential_preferred) != val_prev:
+                    # The preferred credential changed as a result of this operation.
+                    # Discard cached clients.
+                    self.discard_cached_clients()
 
     @property
     def storage_account_key(self):
@@ -706,21 +753,84 @@ class BlobOpBundle():
                 self.populate_storage_account_key()
             return self._storage_account_key
 
+    @property
+    def storage_account_name(self) -> str:
+        '''
+        Getter: name of the storage account for this bundle
+        '''
+        assert isinstance(self._name, StorageAccountName)
+        return self._name.storage_account_name
+
+    def storage_account_url(self, svc:str) -> str:
+        '''
+        Return the URL for the storage acount of this bundle for service svc ('blob', 'queue')
+        '''
+        assert isinstance(self._name, StorageAccountName)
+        return f"https://{self.storage_account_name}.{svc}.{self.cloud.suffixes.storage_endpoint}/"
+
+    _STORAGE_SERVICECLIENT_GET__URL_IS_VALID__TRY_TIME = 5
+
+    def storage_url_is_usable(self, url) -> bool:
+        '''
+        Return whether the given URL is usable
+        '''
+        callpolicy = laaso.msapicall.CallPolicy(nohandle_exceptions=(requests.exceptions.ConnectionError,))
+        # Sometimes we get ConnectionError from a valid storage endpoint.
+        # See that happen repeatedly before deciding the problem is terminal.
+        # All of this checking is necessary because once we hand the storage URL
+        # to the SDK, it will do its own connect retries before declaring failure
+        # in a form that msapicall does not recognize as having already
+        # handled retries, so msapicall does more retries. It ends up taking many
+        # minutes to declare failure, and that's on a per-operation basis.
+        # Instead, we do this check up-front with our own "give up" criteria.
+        # It is imperfect, but it's an imperfect world.
+        attempts = 0
+        t1 = time.monotonic()
+        while True:
+            if attempts:
+                time.sleep(0.25)
+            attempts += 1
+            try:
+                with requests.Session() as session:
+                    msapicall(self.logger, session.get, url=url, laaso_callpolicy=callpolicy)
+                return True
+            except requests.exceptions.ConnectionError:
+                if attempts > 1:
+                    el = time.monotonic() - t1
+                    if el >= self._STORAGE_SERVICECLIENT_GET__URL_IS_VALID__TRY_TIME:
+                        self.logger.warning("%s: after %d attempts over %f seconds, %r is unresponsive", self.mth(), attempts, el, url)
+                        return False
+
+    def _generate_serviceclient(self, svc, kls):
+        '''
+        Generate and return a service client
+        '''
+        assert isinstance(self._name, StorageAccountName)
+        sa_url = self.storage_account_url(svc)
+        if not self.storage_url_is_usable(sa_url):
+            self.logger.warning("%s: invalid storage account url %r", self.mth(), sa_url)
+            return None
+        sc_kwargs = {'credential' : self.sb_credential_preferred}
+        ret = msapicall(self.logger, kls, sa_url, **sc_kwargs)
+        if (not ret) and self.warn_missing:
+            self.logger.warning("%s: cannot generate %s for %r", self.mth(), kls.__name__, self._name)
+        return ret
+
     def populate_blobserviceclient(self):
         '''
         Generate and remember blobserviceclient.
+        Unconditionally re-generates even if it is already previously generated.
         '''
         with self._lock:
-            assert isinstance(self._name, StorageAccountName)
-            if not (self._storage_account_key or self._sas_token or self._credential):
-                self.populate_storage_account_key()
-            self._blobserviceclient = self._manager.blobserviceclient_get(storage_account_name=self._name.storage_account_name,
-                                                                          storage_account_resource_group_name=self.storage_account_resource_group_name,
-                                                                          storage_account_key=self._storage_account_key,
-                                                                          sas_token=self._sas_token,
-                                                                          credential=self._credential)
-            if (not self._blobserviceclient) and self.warn_missing:
-                self.logger.warning("%s.%s cannot generate BlobServiceClient for %r", type(self).__name__, getframe(0), self._name)
+            self._blobserviceclient = self._generate_serviceclient('blob', BLOB_SERVICE_CLIENT)
+
+    def populate_queueserviceclient(self):
+        '''
+        Generate and remember queueserviceclient.
+        Unconditionally re-generates even if it is already previously generated.
+        '''
+        with self._lock:
+            self._queueserviceclient = self._generate_serviceclient('queue', QUEUE_SERVICE_CLIENT)
 
     def populate_containerclient(self):
         '''
@@ -743,6 +853,28 @@ class BlobOpBundle():
                 self._containerclient = None
             if (not self._containerclient) and self.warn_missing:
                 self.logger.warning("%s.%s cannot generate ContainerClient for %r", type(self).__name__, getframe(0), self._name)
+
+    def populate_queueclient(self):
+        '''
+        Generate and remember queueclient.
+        '''
+        with self._lock:
+            if not isinstance(self._name, QueueName):
+                raise ApplicationException("may not %s for %r" % (self.mth(), self._name))
+            qsc = self.queueserviceclient
+            if qsc:
+                try:
+                    self._queueclient = msapicall(self.logger, qsc.get_queue_client, self._name.queue_name)
+                except Exception as exc:
+                    caught = laaso.msapicall.Caught(exc)
+                    if caught.is_missing():
+                        self._queueclient = None
+                    else:
+                        raise
+            else:
+                self._queueclient = None
+            if (not self._queueclient) and self.warn_missing:
+                self.logger.warning("%s.%s cannot generate QueueClient for %r", type(self).__name__, getframe(0), self._name)
 
     def populate_blobclient(self):
         '''
@@ -771,9 +903,7 @@ class BlobOpBundle():
         '''
         Generate and remember datalakeserviceclient.
         '''
-        credential = credential or self._credential or self._sas_token
-        if not credential:
-            credential = self._manager.azure_credential_generate(caller_tag='DataLakeServiceClient')
+        credential = credential or self.sb_credential_preferred
         account_url = "https://{name}.dfs.{storage_endpoint}/".format(name=self._name.storage_account_name, storage_endpoint=self.cloud.suffixes.storage_endpoint)
         with self._lock:
             self._hns_enabled = None
@@ -785,12 +915,12 @@ class BlobOpBundle():
         '''
         Generate and remember filesystemclient.
         '''
-        credential = credential if credential is not None else self._credential
         if not isinstance(self._name, ContainerName):
             raise ApplicationException("may not %s for %r" % (self.mth(), self._name))
+        credential = credential or self.sb_credential_preferred
         with self._lock:
             dsc = self.datalakeserviceclient
-            self._filesystemclient = msapicall(self.logger, dsc.get_file_system_client, self._name.container_name)
+            self._filesystemclient = msapicall(self.logger, dsc.get_file_system_client, self._name.container_name, credential=credential)
             if (not self._filesystemclient) and self.warn_missing:
                 self.logger.warning("%s cannot generate FileSystemClient for %r", self.mth(), self._name)
 
@@ -848,6 +978,16 @@ class BlobOpBundle():
             if (not self._directoryclient) and self.warn_missing:
                 self.logger.warning("%s.%s cannot generate DataLakeDirectoryClient for %r", type(self).__name__, getframe(0), self._name)
 
+    def sa_key_prep(self):
+        '''
+        Depending on which credential we are using and in what environment
+        we are running, credential_implicit may not be sufficient.
+        Add the storage account key if possible.
+        '''
+        with self._lock:
+            if (self.sb_credential_explicit is None) and (not self._sas_token):
+                self.populate_storage_account_key_iff_necessary()
+
     def blob_properties_get(self):
         '''
         Retrieve properties of the target blob
@@ -881,6 +1021,58 @@ class BlobOpBundle():
                 return None
             raise
 
+    def queue_properties_get(self):
+        '''
+        Retrieve properties of the target queue
+        '''
+        qc = self.queueclient
+        if not qc:
+            # already warned iff necessary
+            return None
+        try:
+            return qc.get_queue_properties()
+        except Exception as exc:
+            caught = laaso.msapicall.Caught(exc)
+            if caught.is_missing():
+                return None
+            raise
+
+    def queue_metadata_set(self, metadata):
+        '''
+        Set a metadata (dict) on a queue.
+        '''
+        assert isinstance(metadata, dict)
+        qc = self.queueclient
+        if not qc:
+            raise ApplicationException("queueclient is not populated")
+        qc.set_queue_metadata(metadata=metadata)
+
+    def queue_create(self, metadata=None):
+        '''
+        Create a queue, optionally with metadata
+        '''
+        metadata = metadata or dict()
+        assert isinstance(metadata, dict)
+        qc = self.queueclient
+        if not qc:
+            raise ApplicationException("queueclient is not populated")
+        qc.create_queue(metadata=metadata)
+
+    def queue_delete(self):
+        '''
+        Delete a queue.
+        '''
+        qc = self.queueclient
+        if not qc:
+            raise ApplicationException("queueclient is not populated")
+        try:
+            qc.delete_queue()
+        except Exception as exc:
+            caught = laaso.msapicall.Caught(exc)
+            if caught.is_missing():
+                return
+            raise
+
     def storage_account_get(self):
         '''
         Retrieve attributes of the target storage account
@@ -897,48 +1089,55 @@ class BlobOpBundle():
                 return None
             raise
 
-    def blob_write(self, data, blob_type=BlobType.BlockBlob, tags=None, overwrite=True, length=None):
+    def blob_write(self, data, blob_type=azure.storage.blob.BlobType.BlockBlob, tags=None, overwrite=True, length=None):
         '''
         Write the given data to the target blob
         '''
         if not isinstance(self._name, BlobName):
             raise ApplicationException("may not %s for %r" % (self.mth(), self._name))
         tags = self._manager.tags_get(tags)
+        return self._blob_write(data, blob_type, tags, overwrite, length)
+
+    def _blob_write(self, data, blob_type:azure.storage.blob.BlobType, tags, overwrite:bool, length):
+        '''
+        Write the given data to the target blob
+        '''
+        self.sa_key_prep()
         bc = self.blobclient
         if not bc:
             raise ApplicationException("%s cannot get blobclient for %r" % (self.mth(), self._name))
         return bc.upload_blob(data, blob_type=blob_type, metadata=tags, overwrite=overwrite, length=length)
 
-    def blob_names_iter_get(self, **kwargs):
+    @staticmethod
+    def _listop_iter_get(client, clientop_name:str, **kwargs):
         '''
-        Return an iterator that walks blob names in the container
+        Return an iterator using a given client operation
         '''
-        if not isinstance(self._name, ContainerName):
-            raise ApplicationException("may not %s for %r" % (self.mth(), self._name))
-        cc = self.containerclient
-        if not cc:
-            return list()
+        if not client:
+            return iter(list())
+        clientop = getattr(client, clientop_name)
         try:
-            # https://docs.microsoft.com/en-us/python/api/azure-storage-blob/azure.storage.blob.containerclient?view=azure-python#list-blobs-name-starts-with-none--include-none----kwargs-
-            return cc.list_blobs(**kwargs)
+            return iter(clientop(**kwargs))
         except Exception as exc:
             caught = laaso.msapicall.Caught(exc)
             if caught.is_missing():
                 return iter(list())
             raise
 
-    def blob_names_list(self, blob_type=BlobType.BlockBlob, **kwargs):
+    @staticmethod
+    def _listop_pull(ng, condition=None, transform=None):
         '''
-        Return a list of BlobName objects. This is a hard fetch
-        and consumes memory.
+        ng is an iterator
+        pull it the painful way so we can trap exceptions properly and not discard the whole list
         '''
-        ng = self.blob_names_iter_get(**kwargs)
-        # ng is a generator that yields BlobProperties
-        # pull it the painful way so we can trap exceptions properly and not discard the whole list
+        if not condition:
+            condition = lambda x: True
+        if not transform:
+            transform = lambda x : x
         ret = list()
         while True:
             try:
-                b = next(ng)
+                item = next(ng)
             except StopIteration:
                 break
             except Exception as exc:
@@ -946,42 +1145,62 @@ class BlobOpBundle():
                 if caught.is_missing():
                     break
                 raise
-            if (blob_type is not None) and (b.blob_type != blob_type):
-                continue
-            ret.append(BlobName(self._name.storage_account_name, b.container, b.name, subscription_id=self._name.subscription_id))
+            if condition(item):
+                ret.append(transform(item))
         return ret
+
+    def blob_properties_iter_get(self, **kwargs):
+        '''
+        Return an iterator that yields azure.storage.blob.BlobProperties
+        '''
+        assert isinstance(self._name, ContainerName)
+        self.sa_key_prep()
+        return self._listop_iter_get(self.containerclient, 'list_blobs', **kwargs)
+
+    def blob_names_list(self, blob_type=azure.storage.blob.BlobType.BlockBlob, **kwargs):
+        '''
+        Return a list of BlobName objects. This is a hard fetch
+        and consumes memory.
+        '''
+        ng = self.blob_properties_iter_get(**kwargs)
+        condition = None
+        if blob_type:
+            condition = lambda x: x.blob_type == blob_type
+        transform = lambda x: BlobName(self._name.storage_account_name, x.container, x.name, subscription_id=self._name.subscription_id)
+        return self._listop_pull(ng, condition=condition, transform=transform)
+
+    def container_properties_list_iter_get(self, **kwargs):
+        '''
+        Return an iterator that yields azure.storage.blob.ContainerProperties
+        '''
+        assert isinstance(self._name, StorageAccountName)
+        self.sa_key_prep()
+        return self._listop_iter_get(self.blobserviceclient, 'list_containers', **kwargs)
 
     def container_names_list(self, **kwargs):
         '''
         Return a list of ContainerName objects. This is a hard fetch
         and consumes memory.
         '''
-        bsc = self.blobserviceclient
-        if not bsc:
-            return list()
-        try:
-            # https://docs.microsoft.com/en-us/python/api/azure-storage-blob/azure.storage.blob.blobserviceclient?view=azure-python#list-containers-name-starts-with-none--include-metadata-false----kwargs-
-            ng = bsc.list_containers(**kwargs)
-        except Exception as exc:
-            caught = laaso.msapicall.Caught(exc)
-            if caught.is_missing():
-                return list()
-            raise
-        # ng is a generator that yields ContainerProperties
+        ng = self.container_properties_list_iter_get(**kwargs)
+        return self._listop_pull(ng, transform=lambda x: ContainerName(self._name.storage_account_name, x.name, subscription_id=self._name.subscription_id))
+
+    def queues_list_iter_get(self, **kwargs):
+        '''
+        Return an iterator
+        '''
+        self.sa_key_prep()
+        return self._listop_iter_get(self.queueserviceclient, 'list_queues', **kwargs)
+
+    def queues_list(self, **kwargs):
+        '''
+        Return a list of QueueProperties objects. This is a hard fetch
+        and consumes memory.
+        '''
+        # ng is an iterator that yields QueueProperties
         # pull it the painful way so we can trap exceptions properly and not discard the whole list
-        ret = list()
-        while True:
-            try:
-                c = next(ng)
-            except StopIteration:
-                break
-            except Exception as exc:
-                caught = laaso.msapicall.Caught(exc)
-                if caught.is_missing():
-                    break
-                raise
-            ret.append(ContainerName(self._name.storage_account_name, c.name, subscription_id=self._name.subscription_id))
-        return ret
+        ng = self.queues_list_iter_get(**kwargs)
+        return self._listop_pull(ng)
 
     def blob_get_data(self, **kwargs):
         '''
@@ -989,6 +1208,7 @@ class BlobOpBundle():
         '''
         if not isinstance(self._name, BlobName):
             raise ApplicationException("may not %s for %r" % (self.mth(), self._name))
+        self.sa_key_prep()
         bc = self.blobclient
         if not bc:
             return None
@@ -999,129 +1219,12 @@ class BlobOpBundle():
         # other than bytes.
         return downloader.readall(**kwargs)
 
-class ResourceWrapper():
-    '''
-    Wrapper around a generic Azure SDK resource object.
-    Provides some common attributes and methods to abstract
-    away differences across resources.
-    '''
-    def __init__(self, resource, logger):
-        self._resource = resource
-        self.logger = logger
-        try:
-            self._id = self._resource.id
-        except AttributeError as exc:
-            raise ValueError("resource %r does not appear to be a standard Azure resource object (no id)" % self._resource) from exc
-        if not isinstance(self._id, str):
-            raise ValueError("resource %r does not appear to be a standard Azure resource object (id not str)" % self._resource)
-        toks = self._id.split('/')
-        self._toks = toks
-        self._id_is_standard = not (toks[0] or (toks[1].lower() != 'subscriptions') or (toks[3].lower() != 'resourcegroups') or (toks[5].lower() != 'providers'))
-
-    def __repr__(self):
-        return "<%s,%r>" % (type(self).__name__, self._resource)
-
-    @property
-    def resource(self):
-        '''
-        Getter
-        '''
-        return self._resource
-
-    @property
-    def id(self):
-        '''
-        Getter
-        '''
-        return self._id
-
-    @property
-    def id_toks(self):
-        '''
-        Getter
-        '''
-        return self._toks
-
-    @property
-    def id_is_standard(self):
-        '''
-        Getter
-        '''
-        return self._id_is_standard
-
-    @property
-    def tags(self):
-        '''
-        Getter for tags. Always returns a dict.
-        If there are no tags, the returned dict is empty.
-        If tags cannot be determined, logs a warning and returns an empty dict.
-        '''
-        # resource.tags might be None - that's okay; treat it as an empty dict.
-        # Only warn if there is no resource.tags.
-        try:
-            tags = self._resource.tags or dict()
-        except AttributeError:
-            tags = None
-        if tags is None:
-            self.logger.warning("cannot determine tags for %s:\n%s", self.thing, expand_item_pformat(self._resource))
-            return dict()
-        assert isinstance(tags, dict)
-        return tags
-
-    @property
-    def resource_group(self):
-        '''
-        Getter for resource group
-        '''
-        return self._toks[4]
-
-    @property
-    def thing(self):
-        '''
-        Getter for the RP - eg 'Microsoft.Compute/disks'
-        '''
-        return '/'.join([self._toks[6], self._toks[7]])
-
-    @property
-    def wot(self):
-        '''
-        Getter for everything in the id past self.thing
-        '''
-        return '/'.join(self._toks[8:])
-
-    @property
-    def resource_provisioning_state(self):
-        '''
-        Getter for provisioning state if it can be determined.
-        If it cannot, log a warning and return None.
-        '''
-        try:
-            return self._resource.provisioning_state
-        except AttributeError:
-            pass
-
-        try:
-            return self._resource.properties.provisioning_state
-        except AttributeError:
-            pass
-
-        self.logger.warning("cannot determine provisioning state for %s:\n%s", self.thing, expand_item_pformat(self._resource))
-        return None
-
-    @property
-    def is_deleting(self):
-        '''
-        Return whether this resource is currently deleting.
-        Uses self.resource_provisioning_state property, so if the provisioning state
-        cannot be determined, it logs a warning. In that case, this returns False.
-        '''
-        provisioning_state = self.resource_provisioning_state
-        return provisioning_state and (provisioning_state.lower() == 'deleting')
-
 class Manager(laaso.common.ApplicationWithResourceGroup):
     '''
     Provide a stable API for interating with Azure and handling authentication.
     You'd think the SDKs would do that, but you'd be wrong.
+
+    Related methods are grouped below. Groups are in no particular order.
     '''
     def __init__(self,
                  cert_name='',
@@ -1147,9 +1250,7 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
                  source_vm_name='',
                  storage_account='',
                  subnet_name='',
-                 vm_boot_diags_storage_account='',
                  vm_image_name=None,
-                 vm_image_resource_group='',
                  vm_image_subscription_id='',
                  vm_image_version='',
                  vm_resource_group='',
@@ -1165,8 +1266,8 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
         self.cert_name = cert_name
         self.clientids_filepath = clientids_filepath or self.UAMI_CLIENTIDS_FILE_PATH
         self.disk_name = disk_name
-        self.gallery_name = gallery_name or laaso.scfg.get('dev_gallery_name', '')
-        self.keyvault_name = keyvault_name or laaso.scfg.get('pubkey_keyvault_name', '')
+        self.gallery_name = gallery_name
+        self.keyvault_name = keyvault_name or self.subscription_value_get('pubkeyKeyVaultName', '')
         self.keyvault_resource_group = keyvault_resource_group or self.subscription_value_get('infra_resource_group_default', '')
         self.nic_name = nic_name
         self.nsg_name = nsg_name
@@ -1176,15 +1277,13 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
         self.os_disk_size_gb = int(os_disk_size_gb) if os_disk_size_gb is not None else os_disk_size_gb
         self.pubkey_filename = pubkey_filename or self.pubkey_filename_default()
         self.pubkey_keyvault_client_id = pubkey_keyvault_client_id or ''
-        self.pubkey_keyvault_name = pubkey_keyvault_name or ''
+        self.pubkey_keyvault_name = pubkey_keyvault_name or self.subscription_value_get('pubkeyKeyVaultName', '')
         self.publisher = publisher
         self.source_vm_name = source_vm_name
         self.secret_name = secret_name
         self.storage_account_name = storage_account or ''
         self.subnet_name = subnet_name or self.location_value_get('subnet', '')
-        self.vm_boot_diags_storage_account = vm_boot_diags_storage_account or self.location_value_get('vm_boot_diags_storage_account_default', '') or ''
         self.vm_image_name = vm_image_name
-        self.vm_image_resource_group = vm_image_resource_group or laaso.scfg.get('vm_image_resource_group_default', '')
         self.vm_image_subscription_id = vm_image_subscription_id or self.subscription_id
         self.vm_image_version = vm_image_version
         self.vm_resource_group = vm_resource_group or self.resource_group
@@ -1215,19 +1314,22 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
         self._az_kusto = dict() # key=URI value=KustoClient
 
         # ManagementClient wrappers
-        # Do not access these directly - access them as self.az_* - eg self.az_compute
-        self._az_authorization = None
-        self._az_compute = None
-        self._az_keyvault_mgmt = None
-        self._az_msi = None
-        self._az_network = None
-        self._az_resource = None
-        self._az_storage = None
-        self._az_subscription = None
+        # Do not access these directly - access them as self._az_*_client - eg self._az_compute_client
+        self._az_authorization_cachedclient = None
+        self._az_compute_cachedclient = None
+        self._az_graphrbac_mgmt_cachedclient = None
+        self._az_keyvault_mgmt_cachedclient = None
+        self._az_loganalytics_cachedclient = None
+        self._az_msi_cachedclient = None
+        self._az_network_cachedclient = None
+        self._az_resource_cachedclient = None
+        self._az_storage_cachedclient = None
+        self._az_subscription_cachedclient = None
 
         self._managed_identity_lock = threading.RLock()
         self._managed_identity_azrid = None
-        self._managed_identity_name = managed_identity or laaso.scfg.get('msi_client_id_default', '')
+        self._managed_identity_name = managed_identity or self.subscription_value_get('msiClientIdDefault', '')
+
         if managed_identity_client_id:
             # Only update this if the caller provided something.
             self._pin_client_id = managed_identity_client_id
@@ -1294,12 +1396,90 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
         '''
         cls._pin_client_id = client_id
 
-    @classmethod
-    def arg_resource_group__default(cls):
+    ######################################################################
+    # call wrapping
+    #
+    # At one time, the client constructor methods patched the client
+    # objects to redirect calls through laaso.msapicall.msapicall().
+    # The change to track2/autorestv3 altered the generated objects
+    # so they no longer have common base classes. This transformed
+    # that rewrapping from a small set of well-defined checks to
+    # a mare's nest of special cases.
+    #
+    # This section provides convenience wrappers around... the wrapper.
+    # laaso.msapicall.msapicall() is responsible for adding retries
+    # around a single call and returning the result or (re)raising
+    # the exception. These wrappers add additional boilerplate
+    # semantics. For example, GET-like operations in this module
+    # typically return None rather than raising an exception when
+    # the resource does not exist. The _cw_get() method provides
+    # the boilerplate that transforms the exceptions to a return None.
+
+    def _cw_get(self, call, *args, **kwargs):
         '''
-        Return default resource_group for command-line.
+        Rewrap a generic operation that raises on missing-like errors
+        and instead returns None.
         '''
-        return os.environ.get('AZURE_TOOL_RESOURCE_GROUP', super().arg_resource_group__default())
+        try:
+            return msapicall(self.logger, call, *args, **kwargs)
+        except Exception as exc:
+            caught = laaso.msapicall.Caught(exc)
+            if caught.is_missing():
+                return None
+            raise
+
+    def _cw_list(self, call, *args, transform=None, **kwargs):
+        '''
+        Rewrap a generic operation that lists something.
+        The underlying SDK op returns an iterator (typically from the Paged family).
+        Here, we wrap things so that both generating the iterator
+        and expanding it to a list are retried.
+
+        When the pager cannot be created, this operation returns an empty list.
+
+        transform is an optional callable that takes an item intended
+        for the result list. The return value is what is placed in the
+        result list. For example, to create a list operation that returns
+        only the resource id of the results: transform=lambda x: x.id
+        transform may indicate that an object must not be included in
+        the result by raising CWSkipTransform.
+        '''
+        def _doit(transform, call, *args, **kwargs):
+            '''
+            Create the iterator and expand it to a list.
+            This implementation is simple, but it has the drawback
+            that when an error occurs, we restart the list at the
+            beginning rather than picking up where we left off
+            using the continuation token. If/when that turns out
+            to be a problem, _cw_list() can be updated to not
+            use this wrapper and instead wrap the call to generate
+            the pager and conflate that with appropriate retries
+            expanding the list and using the continuation token.
+            '''
+            # Generating the pager is not wrapped because this method is itself wrapped.
+            pager = call(*args, **kwargs)
+            if not pager:
+                return pager
+            if transform:
+                res = list()
+                for item in pager:
+                    try:
+                        res.append(transform(item))
+                    except CWSkipTransform:
+                        continue
+            else:
+                res = list(pager)
+            return res
+        try:
+            return msapicall(self.logger, functools.partial(_doit, transform, call, *args, **kwargs))
+        except Exception as exc:
+            caught = laaso.msapicall.Caught(exc)
+            if caught.is_missing():
+                return list()
+            raise
+
+    ######################################################################
+    # auth helpers
 
     @property
     def require_msi(self):
@@ -1317,7 +1497,7 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
         return self._managed_identity_name
 
     @property
-    def managed_identity_azrid(self):
+    def managed_identity_azrid(self) -> AzResourceId:
         '''
         Getter; figures out managed_identity_azrid, caches, and returns it
         '''
@@ -1355,565 +1535,6 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
                     raise self.exc_value(f"managed_identity {self._managed_identity_name!r} (id {self.managed_identity_azrid}) not found")
                 self._managed_identity_client_id_for_name = uami.client_id
             return self._managed_identity_client_id_for_name
-
-    def nic_create_parameters(self, vmdesc, network_security_group_id=None, subnet_id=None, tags=None):
-        '''
-        Generate parameters for creating a NIC.
-        If network_security_group_id is not specified, a
-        suitable default is selected or the operation fails.
-        '''
-        if not self.vm_resource_group:
-            raise ApplicationExit("'vm_resource_group' not specified")
-        if not subnet_id:
-            rg = self.vnet_resource_group_name or self.resource_group
-            subnet_obj = self.subnet_get(vnet_resource_group_name=rg, vnet_name=self.vnet_name, subnet_name=self.subnet_name)
-            if not subnet_obj:
-                raise ApplicationExit(f"resource_group {rg!r} vnet {self.vnet_name!r} subnet {self.subnet_name!r} not found")
-            subnet_id = subnet_obj.id
-        network_security_group_id = self.network_security_group_id_effective(network_security_group_id, resource_group=self.resource_group)
-        assert network_security_group_id
-        nic_parameters = {'enable_accelerated_networking' : bool(vmdesc.accelerated_networking),
-                          'enable_ip_forwarding' : False,
-                          'location' : self.location,
-                          'ip_configurations' : [{'name' : vmdesc.nic_name,
-                                                  'private_ip_allocation_method' : 'Dynamic',
-                                                  'public_ip_address' : {'id' : vmdesc.public_ip_id} if vmdesc.public_ip_id else None,
-                                                  'subnet' : {'id' : subnet_id,
-                                                             },
-                                                 },
-                                                ],
-                          'network_security_group' : {'id' : network_security_group_id},
-                          'tags' : self.tags_get(tags),
-                         }
-        return nic_parameters
-
-    def arm_poller(self, operations):
-        '''
-        Return an ARM polling method wrapper usable for the given operations object
-        as a polling_method (polling= arg to an operation).
-        operations is something like self.az_network.network_interfaces
-        msapiwrap will do this automatically under the covers as well.
-        The advantage of doing this early and passing it to the call
-        is it shortens the first polling period. If that does not matter,
-        then it does not matter if this is used or not.
-        '''
-        poller = armpolling_obj_for_operations(operations)
-        poller.logger = self.logger
-        return poller
-
-    def nic_create_issue(self, vmdesc, network_security_group_id=None, subnet_id=None, tags=None, verb='create'):
-        '''
-        Issue a create for the named nic. Save the op in vmdesc. Wait for it to create
-        and return the result. If network_security_group_id is not specified, a
-        suitable default is selected or the operation fails.
-        '''
-        nic_parameters = self.nic_create_parameters(vmdesc, network_security_group_id=network_security_group_id, subnet_id=subnet_id, tags=tags)
-        self.logger.info("%s NIC %s/%s with parameters:\n%s", verb, self.vm_resource_group, vmdesc.nic_name, expand_item_pformat(nic_parameters))
-        poller = self.arm_poller(self.az_network.network_interfaces)
-        vmdesc.nic_create_op = self.az_network.network_interfaces.begin_create_or_update(self.vm_resource_group, vmdesc.nic_name, nic_parameters, polling=poller)
-
-    def _nic_delete(self, nic_name, wait=False):
-        '''
-        Issue a delete for the named NIC
-        '''
-        self.logger.info("issue delete for nic '%s'", nic_name)
-        poller = self.arm_poller(self.az_network.network_interfaces)
-        delete_op = self.az_network.network_interfaces.begin_delete(self.vm_resource_group, nic_name, polling=poller)
-        if wait:
-            self.logger.info("wait for delete of nic '%s'", nic_name)
-            delete_op.wait()
-            self.logger.info("delete nic '%s' result %s", nic_name, expand_item(delete_op.result()))
-        return delete_op
-
-    @command.printable
-    def nic_get(self, resource_group=None, nic_name=None):
-        '''
-        Return azure.mgmt.network.models.NetworkInterface or None
-        '''
-        resource_group = resource_group or self.vm_resource_group
-        if not resource_group:
-            raise ApplicationExit("'resource_group' not specified")
-        nic_name = nic_name or self.nic_name
-        if not nic_name:
-            raise ApplicationExit("'nic_name' not specified")
-        return self._nic_get(resource_group, nic_name)
-
-    def _nic_get(self, resource_group, nic_name):
-        '''
-        Return azure.mgmt.network.models.NetworkInterface or None
-        '''
-        try:
-            return self.az_network.network_interfaces.get(resource_group, nic_name)
-        except Exception as exc:
-            caught = laaso.msapicall.Caught(exc)
-            if caught.is_missing():
-                return None
-            raise
-
-    def nic_get_by_id(self, nic_id):
-        '''
-        Given a nic id ('/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/nic-rg/providers/Microsoft.Network/networkInterfaces/nic-name')
-        do a get and return the NetworkInterface or None for not-found
-        '''
-        azrid = AzResourceId.from_text(nic_id, subscription_id=self.subscription_id, provider_name='Microsoft.Network', resource_type='networkInterfaces')
-        return self._nic_get(azrid.resource_group_name, azrid.resource_name)
-
-    def nic_list(self, resource_group=None):
-        '''
-        List all NICs in the resource_group.
-        '''
-        resource_group = resource_group or self.vm_resource_group
-        assert resource_group
-        return self.az_network.network_interfaces.list(resource_group)
-
-    def nic_list_from_vms(self, resource_group=None):
-        '''
-        Return list of NICs belonging to VMs in resource group that are
-        not tagged with status "discarded".
-        '''
-        vm_list = self.vm_list(resource_group=resource_group)
-        nic_list = list()
-        for vm in vm_list:
-            if vm.tags and vm.tags.get('status', '') == 'discarded':
-                continue
-            for nic in vm.network_profile.network_interfaces:
-                nic = self.nic_get_by_id(nic.id)
-                nic_list.append(nic)
-        return nic_list
-
-    @command.printable_vm_name
-    def vm_nic_get(self, vm_name):
-        '''
-        Return the NIC for a VM. Returns None if the VM or NIC does not exist.
-        '''
-        vm = self.vm_get(vm_name)
-        if not vm:
-            return None
-        for nic in vm.network_profile.network_interfaces:
-            nic_id_split = nic.id.split('/')
-            nic_name = nic_id_split[-1]
-            nic_rg = nic_id_split[4]
-            return self.nic_get(resource_group=nic_rg, nic_name=nic_name)
-
-    def public_ip_get(self, public_ip_name=None, resource_group=None):
-        '''
-        Fetch a public ip: azure.mgmt.network.models.PublicIPAddress or None for not-found
-        '''
-        if not public_ip_name:
-            raise ApplicationExit("'public_ip_name' not specified")
-        resource_group = resource_group or self.resource_group
-        if not resource_group:
-            self.logger.error("'resource_group' not specified")
-            raise ApplicationExit(1)
-        return self._public_ip_get(resource_group, public_ip_name)
-
-    def _public_ip_get(self, resource_group, public_ip_name):
-        '''
-        Return azure.mgmt.network.models.PublicIPAddress or None
-        '''
-        try:
-            return self.az_network.public_ip_addresses.get(resource_group, public_ip_name)
-        except Exception as exc:
-            caught = laaso.msapicall.Caught(exc)
-            if caught.is_missing():
-                return None
-            raise
-
-    def tags_get(self, *args, **kwargs):
-        '''
-        Generate standard Azure tags dict for new resources
-        '''
-        ret = {'owner' : self.username}
-        for d in args:
-            if d:
-                assert isinstance(d, dict)
-                ret.update(d)
-        ret.update(kwargs)
-        assert all(isinstance(x, str) for x in ret.values())
-        return ret
-
-    def vm_create(self, vmdesc, image=None, wait=False, network_security_group_id=None, subnet_id=None, tags=None):
-        '''
-        Do stuff to create the VM
-        '''
-        if not self.vm_resource_group:
-            raise ApplicationExit("vm_resource_group not specified")
-
-        tags = self.tags_get(tags)
-        admin_username = vmdesc.admin_username or self.username
-        if not self.pubkey_filename:
-            raise ApplicationExit("No pubkey_filename specified")
-        if not os.path.isfile(self.pubkey_filename):
-            raise ApplicationExit("%r is not a file" % self.pubkey_filename)
-        with open(self.pubkey_filename, "r") as f:
-            public_key = f.read().strip()
-        pubkey_path_on_vm = "/home/%s/.ssh/authorized_keys" % admin_username
-
-        image_id_resolved = self.vm_image_id_resolve(image)
-        if not image_id_resolved:
-            raise ApplicationExit("cannot resolve image_id %r" % image)
-
-        if not vmdesc.nic_obj:
-            if not vmdesc.nic_create_op:
-                self.nic_create_issue(vmdesc, network_security_group_id=network_security_group_id, subnet_id=subnet_id, tags=tags)
-            vmdesc.nic_create_op_wait(self.logger)
-        nic_objs = [vmdesc.nic_obj]
-        nic_list = [{'id' : nic_obj.id, 'properties' : {'primary' : False}} for nic_obj in nic_objs]
-        nic_list[0]['properties']['primary'] = True
-
-        try:
-            return self._vm_create(vmdesc, image_id_resolved, nic_list, admin_username, public_key, pubkey_path_on_vm, tags=tags, wait=wait)
-        except Exception as exc:
-            self.logger.error("VM creation failed: %r\n%s\n%s", exc, expand_item_pformat(exc, noexpand_types=AZURE_NOEXPAND_TYPES), traceback.format_exc().rstrip())
-
-        raise ApplicationExit("VM creation failed (%s/%s/%s)" % (self.subscription_id, self.vm_resource_group, vmdesc.vm_name))
-
-    def _vm_create(self, vmdesc, image_id, nic_list, admin_username, public_key, pubkey_path_on_vm, tags=None, wait=False):
-        '''
-        Core of vm_create()
-        vmdesc: VMDesc
-        image_id: fully resolved image ID
-        nic_list: NetworkInterfaceReference[] (https://docs.microsoft.com/en-us/rest/api/compute/virtualmachines/createorupdate#networkinterfacereference)
-        admin_username: str, username for admin account generated at boot time
-        pubkey_path_on_vm: str, path on the new VM where the public key for admin_username is stored
-        '''
-        image_reference = self.vm_image_reference(image_id)
-
-        adminpw = f"{vmdesc.vm_name}-apw"
-        output_redact('admin_password', adminpw)
-
-        vm_parameters = {'diagnostics_profile' : {'boot_diagnostics' : {'enabled' : bool(vmdesc.boot_diag_enable)},
-                                                 },
-                         'hardware_profile' : {'vm_size' : vmdesc.vm_size,
-                                              },
-                         'location' : self.location,
-                         'network_profile' : {'network_interfaces' : nic_list,
-                                             },
-                         'os_profile' : {'admin_password' : adminpw,
-                                         'admin_username' : admin_username,
-                                         'computer_name' : vmdesc.vm_name,
-                                         'custom_data' : vmdesc.custom_data,
-                                         'linux_configuration' : {'disable_password_authentication' : True,
-                                                                  'provision_vm_agent' : True,
-                                                                  'ssh' : {'public_keys' : [{'key_data' : public_key,
-                                                                                             'path' : pubkey_path_on_vm,
-                                                                                            },
-                                                                                           ],
-                                                                          }
-                                                                 },
-                                        },
-                         'storage_profile' : {'data_disks' : [],
-                                              'image_reference' : image_reference,
-                                              'os_disk': {'caching' : 'None',
-                                                          'create_option': 'FromImage',
-                                                          'managed_disk' : {'storage_account_type' : VM_OS_DISK_STORAGE_ACCOUNT_TYPE_DEFAULT.value,
-                                                                           },
-                                                          'name' : vmdesc.osdisk_name,
-                                                          'os_type' : 'Linux',
-                                                         },
-                                             },
-                         'tags' : self.tags_get(tags),
-                        }
-
-        if vmdesc.boot_diag_enable and vmdesc.boot_diag_use_storage_account_iff_available and self.vm_boot_diags_storage_account:
-            vm_parameters['diagnostics_profile']['boot_diagnostics']['storage_uri'] = self.storage_account_blob_url(storage_account_name=self.vm_boot_diags_storage_account)
-
-        if self.managed_identity_azrid:
-            vm_parameters['identity'] = {'type' : ResourceIdentityType.user_assigned,
-                                         'user_assigned_identities' : {str(self.managed_identity_azrid) : {}}
-                                        }
-        if self.os_disk_size_gb:
-            vm_parameters['storage_profile']['os_disk']['disk_size_gb'] = int(self.os_disk_size_gb)
-
-        self.logger.info("create VM %s/%s with with parameters:\n%s", self.vm_resource_group, vmdesc.vm_name, expand_item_pformat(vm_parameters))
-        vm_op = self.az_compute.virtual_machines.begin_create_or_update(self.vm_resource_group, vmdesc.vm_name, vm_parameters)
-        vmdesc.vm_create_op = vm_op
-        if wait:
-            self.vm_create_wait(vmdesc.vm_name, vm_op)
-        return vmdesc
-
-    def polling_op_operation_id(self, op):
-        '''
-        Given a polling op, return a best guess at the operation ID for the op.
-        A polling op is a result from a long-running operation such as vm.begin_create_or_update
-        or deployments.begin_create_or_update.
-        '''
-        if isinstance(op, azure.mgmt.resource.resources.models.DeploymentExtended):
-            try:
-                # Not really a polling op - the deployment is running in the background,
-                # and this is the result of creating the deployment.
-                # There's no operation_id in this object, so return what we have.
-                return op.properties.correlation_id
-            except Exception as exc:
-                self.logger.warning("%s op.properties.correlation_id %r", self.mth(), exc)
-            return None
-
-        operation_id = getattr(op, 'operation_id', None)
-        if operation_id:
-            return operation_id
-
-        operation_id_get = getattr(op, 'operation_id_get', None)
-        if operation_id_get:
-            return operation_id_get()
-
-        try:
-            _polling_method = op._polling_method # pylint: disable=protected-access
-        except Exception as exc:
-            self.logger.warning("%s op._polling_method %r", self.mth(), exc)
-            return None
-
-        if _polling_method:
-            operation_id = getattr(_polling_method, 'operation_id', None)
-            if operation_id:
-                return operation_id
-
-        try:
-            _operation = _polling_method._operation # pylint: disable=protected-access
-        except Exception as exc:
-            self.logger.warning("%s op._polling_method._operation %r", self.mth(), exc)
-            return None
-
-        if isinstance(_operation, msrestazure.polling.arm_polling.LongRunningOperation):
-            try:
-                status_link = _operation.get_status_link()
-            except msrestazure.polling.arm_polling.BadResponse:
-                if _operation.method == 'PATCH':
-                    status_link = _operation.initial_response.request.url
-                else:
-                    status_link = ''
-            if status_link and isinstance(status_link, str):
-                path = ''
-                try:
-                    parsed = urllib.parse.urlparse(status_link)
-                except Exception as exc:
-                    self.logger.warning("%s op._polling_method._operation.get_status_link()=%r cannot parse: %r", self.mth(), status_link, exc)
-                    parsed = None
-                if parsed:
-                    path = getattr(parsed, 'path', '')
-                if path:
-                    pathtoks = path.split('/')
-                    if (len(pathtoks) >= 2) and (pathtoks[-2].lower() == 'operations'):
-                        return pathtoks[-1]
-
-        try:
-            location_url = _operation.location_url
-        except Exception as exc:
-            self.logger.warning("%s op._polling_method._operation.location_url %r", self.mth(), exc)
-            return None
-
-        if not location_url:
-            # If we have an operation_id attribute, then either the SDK version we are using
-            # contains bugfixes/improvements that obviate it or we are going through a LaaSO
-            # wrapper. Either way, it is more likely that the operation should not have
-            # an ID (for example, a no-op patch) than it is that this is a problem, so only
-            # log a warning when there is no operation_id attribute.
-            if not hasattr(_operation, 'operation_id'):
-                self.logger.warning("%s op._polling_method._operation.location_url for %s is %r; returning None", self.mth(), type(_operation), location_url)
-            return None
-
-        try:
-            toks = location_url.split('/')
-        except Exception as exc:
-            self.logger.warning("%s op._polling_method._operation.location_url.split('/') %r %r", self.mth(), location_url, exc)
-            return None
-        prev_tok = toks[0]
-        for tok in toks[1:]:
-            if prev_tok.lower() == 'operations':
-                m = RE_UUID_RE.search(tok)
-                if m:
-                    return m.group(0)
-                break
-            prev_tok = tok
-        self.logger.warning("%s cannot parse op._polling_method._operation.location_url %r", self.mth(), location_url)
-        return None
-
-    def vm_create_wait(self, vm_name, vm_op, log_level=logging.INFO):
-        '''
-        Wait for an op returned by _vm_create() to complete
-        '''
-        self.logger.log(log_level, "VM create %s wait (op %s)", vm_name, self.polling_op_operation_id(vm_op))
-        vm_op.wait()
-        vm_res = vm_op.result()
-        # Call self.polling_op_operation_id() again rather than doing it once and
-        # caching because self.polling_op_operation_id() is a hack that tries to
-        # figure it out from undocumented, private interfaces and the answer might
-        # change or improve.
-        self.logger.log(log_level, "VM create %s (op %s) result\n%s", vm_name, self.polling_op_operation_id(vm_op), expand_item_pformat(vm_res))
-        return vm_res
-
-    @command.simple
-    def image_list_print(self, **kwargs):
-        '''
-        List available managed images in the resource group or subscription
-        '''
-        try:
-            resource_group = kwargs.pop('resource_group')
-        except KeyError:
-            resource_group = self.vm_image_resource_group
-        if kwargs:
-            raise TypeError("unexpected argument(s) %s" % sorted(kwargs.keys()))
-        if resource_group:
-            image_iter = self.az_compute.images.list_by_resource_group(resource_group)
-        else:
-            image_iter = self.az_compute.images.list()
-        image_names = ["%s/%s" % (x.id.split('/')[4], x.name) for x in image_iter]
-        image_names.sort()
-        for image_name in image_names:
-            print(image_name)
-
-    @command.simple
-    def vm_image_list_publishers_print(self):
-        '''
-        List available image publishers
-        '''
-        xs = self.az_compute.virtual_machine_images.list_publishers(self.location)
-        xs.sort(key=lambda x: x.name)
-        names = [x.name for x in xs]
-        for name in names:
-            print(name)
-
-    @command.simple
-    def vm_image_list_offers_print(self):
-        '''
-        List available offers from self.publisher
-        '''
-        if not self.publisher:
-            self.logger.error("'publisher' not specified")
-            raise ApplicationExit(1)
-        xs = self.az_compute.virtual_machine_images.list_offers(self.location, self.publisher)
-        xs.sort(key=lambda x: x.name)
-        names = [x.name for x in xs]
-        for name in names:
-            print(name)
-
-    @command.simple
-    def vm_image_list_skus_print(self):
-        '''
-        List available skus from self.publisher/self.offer
-        '''
-        if not self.publisher:
-            self.logger.error("'publisher' not specified")
-            raise ApplicationExit(1)
-        if not self.offer:
-            self.logger.error("'offer' not specified")
-            raise ApplicationExit(1)
-        xs = self.az_compute.virtual_machine_images.list_skus(self.location, self.publisher, self.offer)
-        xs.sort(key=lambda x: x.id)
-        names = [x.name for x in xs]
-        for name in names:
-            print(name)
-
-    def vm_get(self, vm_name, resource_group=None, subscription_id=None):
-        '''
-        Retrieve VM info. Returns None if no such VM.
-        '''
-        resource_group = resource_group or self.vm_resource_group
-        if not resource_group:
-            raise ApplicationExit("'resource_group' not specified")
-        subscription_id = subscription_id or self.subscription_id
-        return self._vm_get(subscription_id, resource_group, vm_name)
-
-    def vm_get_by_id(self, vm_id):
-        '''
-        Given vm_id as resource_id str or AzResourceId, return azure.mgmt.compute.models.VirtualMachine or None
-        '''
-        if isinstance(vm_id, AzResourceId):
-            azrid = vm_id
-        else:
-            azrid = AzResourceId.from_text(vm_id)
-        if not azrid.values_match(provider_name='Microsoft.Compute', resource_type='virtualMachines'):
-            raise ValueError(f"{azrid!r} is not a virtual machine resource")
-        return self._vm_get(azrid.subscription_id, azrid.resource_group_name, azrid.resource_name)
-
-    def _vm_get(self, subscription_id, resource_group, vm_name):
-        '''
-        Return VirtualMachine or None
-        '''
-        try:
-            az_compute = self.az_compute_get(subscription_id)
-            return az_compute.virtual_machines.get(resource_group, vm_name, expand='instanceView')
-        except Exception as exc:
-            caught = laaso.msapicall.Caught(exc)
-            if caught.is_missing():
-                return None
-            raise
-
-    def vm_delete(self, vm_name, resource_group=None, wait=True, verbose=True):
-        '''
-        Delete VM after resource group check
-        '''
-        resource_group = resource_group or self.vm_resource_group
-        if self.vm_get(vm_name, resource_group):
-            return self._vm_delete(resource_group, vm_name, wait, verbose)
-        return None
-
-    def _vm_delete(self, resource_group, vm_name, wait, verbose):
-        '''
-        VM delete completes asynchronously if wait is set to False.
-        '''
-        try:
-            poller = self.arm_poller(self.az_compute.virtual_machines)
-            op = self.az_compute.virtual_machines.begin_delete(resource_group, vm_name, polling=poller)
-            if verbose:
-                self.logger.info("delete virtual machine %s operation_id %r", vm_name, self.polling_op_operation_id(op))
-            if wait:
-                self.vm_delete_op_wait(vm_name, op, verbose)
-        except Exception as exc:
-            caught = laaso.msapicall.Caught(exc)
-            if caught.is_missing():
-                if verbose:
-                    self.logger.info("virtual machine %s does not exist", vm_name)
-                return None
-            self.logger.warning("cannot delete virtual machine %r [%s]: %r", vm_name, caught.reason(), exc)
-            raise
-        return op
-
-    def vm_delete_op_wait(self, vm_name, op, verbose):
-        '''
-        wait for VM delete operation to complete
-        '''
-        if verbose:
-            self.logger.info("wait for virtual machines %s delete", vm_name)
-        op.wait()
-        if verbose:
-            self.logger.info("virtual machine %s deleted", vm_name)
-
-    @staticmethod
-    def vm_id_decompose(vm_id):
-        '''
-        Given a VM id, return (subscription_id, resource_group, vm_name).
-        Example ID:
-            /subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/somerg/providers/Microsoft.Compute/virtualMachines/some-vm
-        '''
-        toks = vm_id.split('/')
-        if len(toks) != 9:
-            raise ValueError("invalid vm_id (len %d)" % len(toks))
-        expect_toks = ((1, 'subscriptions'),
-                       (3, 'resourcegroups'),
-                       (5, 'providers'),
-                       (6, 'microsoft.compute'),
-                       (7, 'virtualmachines'),
-                      )
-        for et in expect_toks:
-            if toks[et[0]].lower() != et[1]:
-                raise ValueError("invalid vm_id (unexpected tok %r index %d)" % (toks[et[0]], et[0]))
-        if not RE_UUID_ABS.search(toks[2]):
-            raise ValueError("invalid vm_id (invalid subscription id %r)" % toks[2])
-        return (toks[2], toks[4], toks[8])
-
-    @command.vm_name
-    def vm_print(self, vm_name):
-        '''
-        Retrieve and print VM info
-        '''
-        if not vm_name:
-            self.logger.error("vm_name not specified")
-            raise ApplicationExit(1)
-        res = self.vm_get(vm_name)
-        if res:
-            pprint.pprint(expand_item(res))
-        else:
-            print("'%s' not found in resource_group '%s'" % (vm_name, self.vm_resource_group))
 
     def client_ids_get(self, add_default_creds=False, client_id=None):
         '''
@@ -1956,56 +1577,276 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
             ret.append(None)
         return ret
 
-    def vm_power_off(self, vm_resource_group, vm_name):
-        '''
-        Stop (power off) a VM. This does not deallocate it.
-        '''
-        if not vm_resource_group:
-            raise ApplicationExit("'vm_resource_group' not specified")
-        if not vm_name:
-            raise ApplicationExit("'vm_name' not specified")
-        while True:
-            poller = self.arm_poller(self.az_compute.virtual_machines)
-            power_off_op = self.az_compute.virtual_machines.begin_power_off(vm_resource_group, vm_name, polling=poller)
-            power_off_operation_id = self.polling_op_operation_id(power_off_op)
-            self.logger.info("VM %r power_off wait operation_id=%s", vm_name, power_off_operation_id)
-            power_off_op.wait()
-            power_off_res = power_off_op.result()
-            self.logger.info("VM %r power_off operation_id=%s result:\n%s", vm_name, power_off_operation_id, expand_item_pformat(power_off_res))
-            vm_obj = self.vm_get(vm_name, resource_group=vm_resource_group)
-            if not vm_obj:
-                self.logger.error("VM %r disappeared following power off operation_id=%s", vm_name, power_off_operation_id)
-                raise ApplicationExit("VM %r disappeared following power off" % vm_name)
-            if not vm_obj.instance_view:
-                self.logger.warning("VM %r has no instance_view following power off operation_id=%s (will retry)", vm_name, power_off_operation_id)
-                continue
-            if not vm_obj.instance_view.statuses:
-                self.logger.warning("VM %r instance_view has no statuses following power off operation_id=%s (will retry)", vm_name, power_off_operation_id)
-                continue
-            status_code = vm_obj.instance_view.statuses[-1].code
-            if status_code != 'PowerState/stopped':
-                self.logger.warning("VM %r completed power_off operation_id=%s but has status %r",
-                                    vm_name, power_off_operation_id, status_code)
-                continue
-            # VM is stopped
-            break
-        self.logger.info("VM %r status %r following power off", vm_name, status_code)
+    ######################################################################
+    # tags helpers
 
-    def vm_generalize(self, vm_resource_group, vm_name):
+    def tags_get(self, *args, **kwargs):
         '''
-        Generalize the named VM
+        Generate standard Azure tags dict for new resources
         '''
-        generalize_res = self.az_compute.virtual_machines.generalize(vm_resource_group, vm_name)
-        self.logger.info("VM %r generalize result:\n%s", vm_name, expand_item_pformat(generalize_res))
+        ret = {'owner' : self.username}
+        for d in args:
+            if d:
+                assert isinstance(d, dict)
+                ret.update(d)
+        ret.update(kwargs)
+        assert all(isinstance(x, str) for x in ret.values())
+        return ret
 
-    @command.simple
-    def vm_sizes_print(self):
+    ######################################################################
+    # LRO support
+
+    def arm_poller(self, operations):
         '''
-        Print vm sizes
+        Return an ARM polling method wrapper usable for the given operations object
+        as a polling_method (polling= arg to an operation).
+        operations is something like self._az_network_client.network_interfaces
+        msapiwrap will do this automatically under the covers as well.
+        The advantage of doing this early and passing it to the call
+        is it shortens the first polling period. If that does not matter,
+        then it does not matter if this is used or not.
         '''
-        vm_size_iter = self.az_compute.virtual_machine_sizes.list(location=self.location)
-        for vm_size_obj in vm_size_iter:
-            print(expand_item_pformat(vm_size_obj))
+        poller = armpolling_obj_for_operations(operations)
+        poller.logger = self.logger
+        return poller
+
+    def polling_op_operation_id(self, op):
+        '''
+        Given a polling op, return a best guess at the operation ID for the op.
+        A polling op is a result from a long-running operation such as vm.begin_create_or_update
+        or deployments.begin_create_or_update.
+        '''
+        return laaso.msapicall.laaso_lro_operation_id(op, self.logger, caller=getframe(1))
+
+    ######################################################################
+    # network watcher mgmt
+
+    NETWORK_WATCHER_AZRID_VALUES = {'provider_name' : 'Microsoft.Network',
+                                    'resource_type' : 'networkWatchers',
+                                   }
+
+    @classmethod
+    def network_watcher_azrid_build(cls, subscription_id, resource_group, resource_name) -> AzResourceId:
+        '''
+        Build azrid
+        '''
+        return AzResourceId.build(subscription_id, resource_group, resource_name, cls.NETWORK_WATCHER_AZRID_VALUES)
+
+    @classmethod
+    def is_network_watcher_resource_id(cls, resource_id) -> bool:
+        '''
+        Return whether resource_id is a network watcher
+        '''
+        azrid = azrid_normalize_or_none(resource_id, AzResourceId, cls.NETWORK_WATCHER_AZRID_VALUES)
+        return azrid and azrid_is(azrid, AzResourceId, **cls.NETWORK_WATCHER_AZRID_VALUES)
+
+    ######################################################################
+    # nic mgmt and helpers
+
+    NIC_AZRID_VALUES = {'provider_name' : 'Microsoft.Network',
+                        'resource_type' : 'networkInterfaces',
+                       }
+
+    @classmethod
+    def nic_azrid(cls, resource_id) -> AzResourceId:
+        '''
+        Return resource_id in AzResourceId form.
+        '''
+        return azrid_normalize(resource_id, AzResourceId, cls.NIC_AZRID_VALUES)
+
+    @classmethod
+    def nic_azrid_build(cls, subscription_id, resource_group, resource_name) -> AzResourceId:
+        '''
+        Build azrid
+        '''
+        return AzResourceId.build(subscription_id, resource_group, resource_name, cls.NIC_AZRID_VALUES)
+
+    @command.printable
+    def nic_get(self, resource_group=None, nic_name=None):
+        '''
+        Return azure.mgmt.network.models.NetworkInterface or None
+        '''
+        resource_group = resource_group or self.vm_resource_group
+        if not resource_group:
+            raise ApplicationExit("'resource_group' not specified")
+        nic_name = nic_name or self.nic_name
+        if not nic_name:
+            raise ApplicationExit("'nic_name' not specified")
+        return self._nic_get(resource_group, nic_name)
+
+    def nic_get_by_id(self, nic_id):
+        '''
+        Given a nic id ('/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/nic-rg/providers/Microsoft.Network/networkInterfaces/nic-name')
+        do a get and return the NetworkInterface or None for not-found
+        '''
+        azrid = AzResourceId.from_text(nic_id, subscription_id=self.subscription_id, provider_name='Microsoft.Network', resource_type='networkInterfaces')
+        return self._nic_get(azrid.resource_group_name, azrid.resource_name)
+
+    def _nic_get(self, resource_group, nic_name):
+        '''
+        Return azure.mgmt.network.models.NetworkInterface or None
+        '''
+        try:
+            return self._az_network_client.network_interfaces.get(resource_group, nic_name)
+        except Exception as exc:
+            caught = laaso.msapicall.Caught(exc)
+            if caught.is_missing():
+                return None
+            raise
+
+    def nic_list(self, resource_group=None):
+        '''
+        List all NICs in the resource_group.
+        '''
+        resource_group = resource_group or self.vm_resource_group
+        assert resource_group
+        return self._az_network_client.network_interfaces.list(resource_group)
+
+    def nic_list_from_vms(self, resource_group=None):
+        '''
+        Return list of NICs belonging to VMs in resource group that are
+        not tagged with status "discarded".
+        '''
+        vm_list = self.vm_list(resource_group=resource_group)
+        nic_list = list()
+        for vm in vm_list:
+            if vm.tags and vm.tags.get('status', '') == 'discarded':
+                continue
+            for nic in vm.network_profile.network_interfaces:
+                nic = self.nic_get_by_id(nic.id)
+                nic_list.append(nic)
+        return nic_list
+
+    def nic_create_or_update(self, resource_id, params) -> azure.mgmt.network.models.NetworkInterface:
+        '''
+        Return azure.mgmt.network.models.NetworkInterface
+        '''
+        azrid = self.nic_azrid(resource_id)
+        ret = self._nic_create_or_update(azrid, params)
+        return ret
+
+    def _nic_create_or_update(self, azrid, params) -> azure.mgmt.network.models.NetworkInterface:
+        '''
+        Return azure.mgmt.network.models.NetworkInterface
+        '''
+        az_network = self._az_network_get(azrid.subscription_id)
+        poller = self.arm_poller(az_network.network_interfaces)
+        poller.laaso_max_delay = 15
+        op = az_network.network_interfaces.begin_create_or_update(azrid.resource_group_name, azrid.resource_name, params, polling=poller)
+        laaso_lro_wait(op, 'network.network_interfaces.create_or_update', self.logger)
+        return op.result()
+
+    def nic_delete(self, resource_id, wait=True):
+        '''
+        Launch delete of a network interface and optionally wait for it.
+        Returns LRO-like object or None.
+        '''
+        azrid = self.nic_azrid(resource_id)
+        op = self._nic_delete(azrid)
+        if wait and op:
+            laaso_lro_wait(op, 'network.network_interfaces.delete', self.logger)
+        return op
+
+    def _nic_delete(self, azrid:AzResourceId):
+        '''
+        Issue a delete for a network interface and return None (already gone) or the LRO object
+        '''
+        az_network = self._az_network_get(azrid.subscription_id)
+        poller = self.arm_poller(az_network.network_interfaces)
+        poller.laaso_max_delay = 15
+        try:
+            return az_network.network_interfaces.begin_delete(azrid.resource_group_name, azrid.resource_name, polling=poller)
+        except Exception as exc:
+            caught = laaso.msapicall.Caught(exc)
+            if caught.is_missing():
+                return None
+            raise
+
+    ######################################################################
+    # public ip mgmt
+
+    PUBLIC_IP_AZRID_VALUES = {'provider_name' : 'Microsoft.Network',
+                              'resource_type' : 'publicIPAddresses',
+                             }
+
+    @classmethod
+    def public_ip_azrid(cls, resource_id) -> AzResourceId:
+        '''
+        Return resource_id in AzResourceId form.
+        '''
+        return azrid_normalize(resource_id, AzResourceId, cls.PUBLIC_IP_AZRID_VALUES)
+
+    @classmethod
+    def public_ip_azrid_build(cls, subscription_id, resource_group, resource_name) -> AzResourceId:
+        '''
+        Build azrid
+        '''
+        return AzResourceId.build(subscription_id, resource_group, resource_name, cls.PUBLIC_IP_AZRID_VALUES)
+
+    def public_ip_get(self, public_ip_name=None, resource_group=None):
+        '''
+        Fetch a public ip: azure.mgmt.network.models.PublicIPAddress or None for not-found
+        '''
+        if not public_ip_name:
+            raise ApplicationExit("'public_ip_name' not specified")
+        resource_group = resource_group or self.resource_group
+        if not resource_group:
+            self.logger.error("'resource_group' not specified")
+            raise ApplicationExit(1)
+        return self._public_ip_get(resource_group, public_ip_name)
+
+    def _public_ip_get(self, resource_group, public_ip_name):
+        '''
+        Return azure.mgmt.network.models.PublicIPAddress or None
+        '''
+        try:
+            return self._az_network_client.public_ip_addresses.get(resource_group, public_ip_name)
+        except Exception as exc:
+            caught = laaso.msapicall.Caught(exc)
+            if caught.is_missing():
+                return None
+            raise
+
+    def public_ip_create_or_update(self, resource_id, params) -> azure.mgmt.network.models.PublicIPAddress:
+        '''
+        Create or update for public IP
+        Returns azure.mgmt.network.models.PublicIPAddress
+        '''
+        azrid = self.public_ip_azrid(resource_id)
+        ret = self._public_ip_create_or_update(azrid, params)
+        return ret
+
+    def _public_ip_create_or_update(self, azrid, params) -> azure.mgmt.network.models.PublicIPAddress:
+        '''
+        Create or update for public IP
+        Returns azure.mgmt.network.models.PublicIPAddress
+        '''
+        az_network = self._az_network_get(azrid.subscription_id)
+        poller = self.arm_poller(az_network.public_ip_addresses)
+        op = az_network.public_ip_addresses.begin_create_or_update(azrid.resource_group_name, azrid.resource_name, params, polling=poller)
+        laaso_lro_wait(op, 'network.public_ip_addresses.create_or_update', self.logger)
+        return op.result()
+
+    ######################################################################
+    # managed disk mgmt
+
+    DISK_AZRID_VALUES = {'provider_name' : 'Microsoft.Compute',
+                         'resource_type' : 'disks',
+                        }
+
+    @classmethod
+    def disk_azrid(cls, resource_id) -> AzResourceId:
+        '''
+        Return resource_id in AzResourceId form.
+        '''
+        return azrid_normalize(resource_id, AzResourceId, cls.DISK_AZRID_VALUES)
+
+    @classmethod
+    def disk_azrid_build(cls, subscription_id, resource_group, resource_name) -> AzResourceId:
+        '''
+        Build azrid
+        '''
+        return AzResourceId.build(subscription_id, resource_group, resource_name, cls.DISK_AZRID_VALUES)
 
     @command.printable
     def disk_get(self, disk_name=None, resource_group=None):
@@ -2025,302 +1866,69 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
         Return azure.mgmt.compute.models.Disk or None
         '''
         try:
-            return self.az_compute.disks.get(resource_group, disk_name)
+            return self._az_compute_client.disks.get(resource_group, disk_name)
         except Exception as exc:
             caught = laaso.msapicall.Caught(exc)
             if caught.is_missing():
                 return None
             raise
 
-    def vm_primary_nic_addr_get(self, vm_info):
+    def disk_create_or_update(self, azrid, params) -> azure.mgmt.compute.models.Disk:
         '''
-        Extract the primary network address from vm_info as returned by vm_get()
+        Create or update Azure managed disk
         '''
-        if len(vm_info.network_profile.network_interfaces) == 1:
-            # Special case; not always marked as primary
-            nic = vm_info.network_profile.network_interfaces[0]
-        else:
-            for nic in vm_info.network_profile.network_interfaces:
-                if nic.primary:
-                    break
-            else:
-                self.logger.error("No primary NIC for VM %s", vm_info.name)
-                return None
-        nic_info = self.nic_get_by_id(nic.id)
-        if not nic_info:
-            self.logger.warning("VM %s has NIC %s which does not exist", vm_info.id, nic.id)
-            return None
-        config = None
-        for config in nic_info.ip_configurations:
-            if config.primary:
-                return config.private_ip_address
-        self.logger.warning("no primary config found for NIC %s", nic_info.id)
-        return None
-
-    @command.printable
-    def deployment_get(self, deployment_name, resource_group=None, subscription_id=None, pretty=False):
-        '''
-        retrieve a deployment to list all resource provisioned/deployed
-        '''
-        resource_group = resource_group or self.resource_group
-        if not resource_group:
-            self.logger.error("'resource_group' not specified")
-            raise ApplicationExit(1)
-        subscription_id = subscription_id or self.subscription_id
-        if not subscription_id:
-            self.logger.error("'subscription_id' not specified")
-            raise ApplicationExit(1)
-        az_resource = self.az_resource_get(subscription_id)
-        try:
-            deployment = az_resource.deployments.get(deployment_name=deployment_name, resource_group_name=resource_group)
-        except Exception as exc:
-            caught = laaso.msapicall.Caught(exc)
-            self.logger.info('exception raised while deploying %r in RG %r', deployment_name, resource_group)
-            if caught.is_missing():
-                return None
-            raise
-        if not pretty:
-            return deployment
-        ret = {'additional_properties' : deployment.additional_properties,
-               'id' : deployment.id,
-               'location' : deployment.location,
-               'name' : deployment.name,
-               'correlation_id' : deployment.properties.correlation_id,
-               'error' : deployment.properties.error,
-               'output_resources': deployment.properties.output_resources,
-               'provisioning_state' : deployment.properties.provisioning_state,
-               'timestamp' : deployment.properties.timestamp.strftime('%Y-%m-%d %H:%M:%S.%f'),
-              }
+        azrid.values_sanity(self.DISK_AZRID_VALUES)
+        ret = self._disk_create_or_update(azrid, params)
         return ret
 
-    @command.printable
-    def deployments_list_failed_by_resource_group(self, resource_group=None, pretty=False):
+    def _disk_create_or_update(self, azrid, params) -> azure.mgmt.compute.models.Disk:
         '''
-        Retrieve failed deployments for the given resource_group
+        Create or update Azure managed disk
         '''
-        resource_group = resource_group or self.resource_group
-        if not resource_group:
-            self.logger.error("'resource_group' not specified")
-            raise ApplicationExit(1)
-        try:
-            deployments = [x for x in self.az_resource.deployments.list_by_resource_group(resource_group) if x.properties.error is not None]
-        except Exception as exc:
-            caught = laaso.msapicall.Caught(exc)
-            if caught.is_missing():
-                return None
-            raise
-        if not pretty:
-            return deployments
-        ret = list()
-        for d in deployments:
-            ret.append({'additional_properties' : d.additional_properties,
-                        'id' : d.id,
-                        'location' : d.location,
-                        'name' : d.name,
-                        'correlation_id' : d.properties.correlation_id,
-                        'error' : d.properties.error,
-                        'provisioning_state' : d.properties.provisioning_state,
-                        'timestamp' : d.properties.timestamp.strftime('%Y-%m-%d %H:%M:%S.%f'),
-                       })
-        return ret
+        az_compute = self._az_compute_get(azrid.subscription_id)
+        poller = self.arm_poller(az_compute.disks)
+        poller.laaso_min_delay = 5
+        op = az_compute.disks.begin_create_or_update(azrid.resource_group_name, azrid.resource_name, params, polling=poller)
+        laaso_lro_wait(op, 'compute.disks.create_or_update', self.logger)
+        return op.result()
 
-    @command.simple
-    def deployments_log_failed_by_resource_group(self, resource_group=None, logger=None, log_level=logging.ERROR, pretty=False):
+    def disk_delete(self, resource_group, resource_name, wait=True):
         '''
-        Retrieve failed deployments for the given resource_group and log them.
-        Log and swallow Exceptions.
+        Issue a delete for a disk and optionally wait for it to finish.
+        Returns the LRO object.
         '''
-        logger = logger if logger is not None else self.logger
-        resource_group = resource_group or self.resource_group
-        if not resource_group:
-            self.logger.error("'resource_group' not specified")
-            raise ApplicationExit(1)
-        try:
-            failures = self.deployments_list_failed_by_resource_group(resource_group=resource_group, pretty=pretty)
-        except Exception as exc:
-            logger.error("cannot retrieve deployments for resource_group %r: %r\n%s",
-                         resource_group, exc, expand_item_pformat(exc))
-            return
-        if failures is None:
-            logger.log(log_level, "cannot retrieve deployments for resource_group %r because it does not exist",
-                       resource_group)
-            return
-        if not failures:
-            logger.log(log_level, "no failed deployments for resource_group %r",
-                       resource_group)
-            return
-        s = ' (simplified)' if pretty else ''
-        logger.log(log_level, "failed deployments%s for resource_group %r:\n%s",
-                   s, resource_group, expand_item_pformat(failures))
-
-    def vm_find(self, vm_name):
-        '''
-        Return a list of VMs found across resource groups for the subscription
-        '''
-        rgs = self.resource_groups_list()
-        ret = list()
-        for rg in rgs:
-            vm = self.vm_get(vm_name, resource_group=rg.name)
-            if vm:
-                ret.append(vm)
-        return ret
-
-    @command.vm_name
-    def vm_find_print(self, vm_name):
-        '''
-        Print IDs of VMs with this name in the subscription
-        '''
-        vms = self.vm_find(vm_name)
-        vms.sort(key=lambda x: x.id)
-        for vm in vms:
-            print(vm.id)
-
-    # Shared across instances so that different threads/applications
-    # using different managers serialize against one another.
-    _resource_group_create_lock = threading.RLock()
-
-    @property
-    def resource_group_create_lock(self):
-        '''
-        Getter
-        '''
-        return self._resource_group_create_lock
-
-    @command.simple
-    def resource_group_create_iff_necessary(self, resource_group=None, location=None, tags=None):
-        '''
-        Create resource_group
-        '''
-        resource_group = resource_group or self.resource_group
-        if not resource_group:
-            raise ApplicationExit("'resource_group' not specified")
-        with self.resource_group_create_lock:
-            resource_group_obj = self.resource_group_get(resource_group=resource_group)
-            if resource_group_obj:
-                self.logger.debug("resource_group %s already exists", resource_group)
-                return resource_group_obj
-            ret = self.resource_group_create(resource_group=resource_group, location=location, tags=tags)
-            self.logger.debug("created resource_group %s", resource_group)
-            return ret
-
-    _resource_groups_created = list()
-
-    @property
-    def resource_groups_created(self):
-        '''
-        Getter
-        '''
-        return list(self._resource_groups_created)
-
-    @command.simple
-    def resource_group_create(self, resource_group=None, location=None, tags=None):
-        '''
-        Create resource_group. Return azure.mgmt.resource.resources.models.ResourceGroup.
-        '''
-        resource_group = resource_group or self.resource_group
-        location = location or self.location
-        if not resource_group:
-            self.logger.error("'resource_group' not specified")
-            raise ApplicationExit(1)
-        parameters = {'location': location,
-                      'tags': self.tags_get(tags),
-                      }
-        self.logger.info("create resource_group %s with parameters:\n%s", resource_group, expand_item_pformat(parameters))
-        res = self._resource_group_create_or_update(resource_group, parameters)
-        self.logger.info("resource_group %s create result:\n%s", resource_group, expand_item_pformat(res))
-        if res:
-            self._resource_groups_created.append(res)
-        return res
-
-    @command.wait
-    def resource_group_delete(self, resource_group=None, wait=False, verbose=True):
-        '''
-        Issue resource group delete and return the op. Returns None
-        if the resource_group does not exist.
-        '''
-        resource_group = resource_group or self.resource_group
-        if not resource_group:
-            self.logger.error("'resource_group' not specified")
-            raise ApplicationExit(1)
-        if any(resource_group.lower() == x.lower() for x in laaso.scfg.tget('resource_groups_keep', tuple)):
-            raise ResourceGroupMayNotBeDeleted(f"policy forbids deleting resource_group {resource_group!r}")
-        if verbose:
-            self.logger.info("delete resource group %s", resource_group)
-        poller = self.arm_poller(self.az_compute.gallery_images)
-        try:
-            op = self.az_resource.resource_groups.begin_delete(resource_group, polling=poller)
-            # Do the wait in this block to get the logging
-            if wait:
-                self.resource_group_delete_op_wait(resource_group, op, verbose=verbose)
-        except Exception as exc:
-            caught = laaso.msapicall.Caught(exc)
-            if caught.is_missing():
-                if verbose:
-                    self.logger.info("resource group %s does not exist", resource_group)
-                return None
-            self.logger.warning("cannot delete resource group %r [%s]: %r", resource_group, caught.reason(), exc)
-            raise
+        op = self._disk_delete(resource_group, resource_name)
+        if wait and op:
+            laaso_lro_wait(op, 'compute.sisks.delete', self.logger)
         return op
 
-    def resource_group_delete_op_wait(self, resource_group, op, verbose=True):
+    def _disk_delete(self, resource_group, resource_name):
         '''
-        Wait for a resource_group_delete operation to complete
+        Issue a delete for a disk and optionally wait for it to finish.
+        Returns the LRO object if the delete is running, or None if the delete is already done.
         '''
-        if verbose:
-            self.logger.info("wait for resource group %s delete", resource_group)
-        op.wait()
-        if verbose:
-            self.logger.info("resource group %s deleted", resource_group)
+        az_compute = self._az_compute_client
+        poller = self.arm_poller(az_compute.disks)
+        poller.laaso_max_delay = 15
+        try:
+            return az_compute.disks.begin_delete(resource_group, resource_name, polling=poller)
+        except Exception as exc:
+            caught = laaso.msapicall.Caught(exc)
+            if caught.is_missing():
+                return None
+            raise
 
-    def vmdescs_generate(self, vm_names, nic_names=None, custom_data=None, public_ip_id=None):
-        '''
-        Generate and return a list of VMDesc objects for the given vm_names.
-        If provided, nic_names must be an identical length of names for the NICs.
-        '''
-        vm_size = self.vm_size
-        nic_names = nic_names or [None for _ in range(len(vm_names))]
-        return [VMDesc(vm_name,
-                       vm_size,
-                       nic_name=nic_name,
-                       custom_data=custom_data,
-                       accelerated_networking=self.vm_size_supports_accelerated_networking(vm_size),
-                       public_ip_id=public_ip_id)
-                for vm_name, nic_name in zip(vm_names, nic_names)]
+    ######################################################################
+    # SKU ops, including vm_size and resource location availability
 
-    def vms_create(self, vm_names, image=None, tags=None, wait=True, network_security_group_id=None, subnet_id=None, **kwargs):
+    @command.simple
+    def vm_sizes_print(self):
         '''
-        Create multiple VMs. Generate the vmdescs and invoke vm_create_do.
+        Print vm sizes
         '''
-        vmdescs = self.vmdescs_generate(vm_names, **kwargs)
-        return self.vms_create_do(vmdescs, image=image, tags=tags, wait=wait, network_security_group_id=network_security_group_id, subnet_id=subnet_id)
-
-    def vms_create_do(self, vmdescs, image=None, tags=None, wait=True, network_security_group_id=None, subnet_id=None):
-        '''
-        Perform the creates for each VMDesc in vmdescs.
-        '''
-        if not vmdescs:
-            self.logger.warning("%s.%s: no vmdescs", type(self).__name__, getframename(0))
-            return vmdescs
-        for vmdesc in vmdescs:
-            # Optimization: skip the get if the caller did not provide a NIC name
-            if vmdesc.nic_name_provided:
-                vmdesc.nic_obj = self.nic_get(resource_group=self.vm_resource_group, nic_name=vmdesc.nic_name)
-            if not vmdesc.nic_obj:
-                self.nic_create_issue(vmdesc, network_security_group_id=network_security_group_id, subnet_id=subnet_id)
-        for vmdesc in vmdescs:
-            self.vm_create(vmdesc, wait=False, image=image, tags=tags)
-        if wait:
-            for vmdesc in vmdescs:
-                vmdesc.vm_create_res = self.vm_create_wait(vmdesc.vm_name, vmdesc.vm_create_op)
-            self.vmdescs_log(vmdescs)
-        return vmdescs
-
-    def vmdescs_log(self, vmdescs):
-        '''
-        Log a list of vmdescs
-        '''
-        vmdescs = sorted(vmdescs, key=lambda x: x.vm_name)
-        self.logger.info("VMs:\n%s", '\n'.join([x.log_ip_str() for x in vmdescs]))
+        vm_size_iter = self._az_compute_client.virtual_machine_sizes.list(location=self.location)
+        for vm_size_obj in vm_size_iter:
+            print(expand_item_pformat(vm_size_obj))
 
     @staticmethod
     def sku_capability_get_int(sku, name, *args):
@@ -2399,47 +2007,27 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
         return False
 
     @command.printable
-    def vm_size_supports_accelerated_networking(self, vm_size, location=None):
+    def vm_size_supports_accelerated_networking(self, vm_size, location):
         '''
         Given a VM size, return whether it supports accelerated networking.
         Returns None/False/True. None is implicit; the sku descriptor does
         not say, or the vm_size is not known. False and True are explicit.
         '''
-        if location:
-            sku = self.vm_skus_dict_get_any_location(vm_size, location=location)
-            if not sku:
-                self.logger.warning("%r not present in location %r; assuming accelerated_networking is not supported", vm_size, location)
-                return None
-            return sku_has_capability(sku, 'AcceleratedNetworkingEnabled', sku.capabilities, self.logger)
-        try:
-            by_location = self.vm_skus_dict[vm_size]
-        except KeyError:
-            self.logger.warning("%r is not a known vm_size; cannot determine accelerated_networking", vm_size)
+        assert location
+        sku = self.vm_skus_dict_get_any_location(vm_size, location=location)
+        if not sku:
+            self.logger.warning("%r not present in location %r; assuming accelerated_networking is not supported", vm_size, location)
             return None
-        if not by_location:
-            self.logger.warning("%r not present in any location; cannot determine accelerated_networking", vm_size)
-            return None
-        ret = None
-        for skus in by_location.values():
-            for sku in skus:
-                has_capability = sku_has_capability(sku, 'AcceleratedNetworkingEnabled', sku.capabilities, self.logger)
-                if ret is None:
-                    ret = has_capability
-                elif ret != has_capability:
-                    self.logger.warning("%r has inconsistent AcceleratedNetworkingEnabled across locations; cannot determine accelerated_networking", vm_size)
-                    return None
-        if ret is None:
-            self.logger.warning("%r is present in at least one location but none specify whether AcceleratedNetworkingEnabled is supported; cannot determine accelerated_networking", vm_size)
-        return ret
+        return sku_has_capability(sku, 'AcceleratedNetworkingEnabled', sku.capabilities, self.logger)
 
     @command.simple
     def vm_sizes_accelerated_networking_print(self):
         '''
         Show accelerated_networking support for all vm sizes.
         '''
-        vm_size_iter = self.az_compute.virtual_machine_sizes.list(location=self.location)
+        vm_size_iter = self._az_compute_client.virtual_machine_sizes.list(location=self.location)
         vm_sizes = sorted([x.name for x in vm_size_iter])
-        vals = [[vm_size, self.vm_size_supports_accelerated_networking(vm_size)] for vm_size in vm_sizes]
+        vals = [[vm_size, self.vm_size_supports_accelerated_networking(vm_size, self.location)] for vm_size in vm_sizes]
         print(tabulate(vals, tablefmt='plain', numalign='left', stralign='left'))
 
     # shared across instances to avoid fetching it more than once
@@ -2486,7 +2074,7 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
         '''
         Return a list of known SKUs.
         '''
-        return list(self.az_compute.resource_skus.list())
+        return list(self._az_compute_client.resource_skus.list())
 
     def skudict_insert(self, skudict, sku):
         '''
@@ -2691,169 +2279,10 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
                     return True
         return False
 
-    @command.simple
-    def image_gallery_create(self, resource_group=None, gallery_name=None, tags=None):
-        '''
-        Create an image gallery
-        '''
-        resource_group = resource_group or self.resource_group or self.vm_image_resource_group
-        if not resource_group:
-            raise ApplicationExit("'resource_group' not specified")
-        gallery_name = gallery_name or self.gallery_name
-        if not gallery_name:
-            raise ApplicationExit("'gallery_name' not specified")
-        parameters = {'location' : self.location,
-                      'tags' : self.tags_get(tags),
-                     }
-        self.logger.info("create image_gallery %s/%s with parameters:\n%s", resource_group, gallery_name, expand_item_pformat(parameters))
-        op = self.az_compute.galleries.begin_create_or_update(resource_group, gallery_name, parameters)
-        self.logger.info("create image_gallery %s/%s wait for completion", resource_group, gallery_name)
-        op.wait()
-        res = op.result()
-        self.logger.info("create image_gallery %s/%s result:\n%s", resource_group, gallery_name, expand_item_pformat(res))
-        return res
+    ######################################################################
+    # Storage
 
-    @command.simple
-    def image_gallery_delete(self, resource_group=None, gallery_name=None):
-        '''
-        Delete an image gallery
-        '''
-        resource_group = resource_group or self.resource_group or self.vm_image_resource_group
-        if not resource_group:
-            raise ApplicationExit("'resource_group' not specified")
-        gallery_name = gallery_name or self.gallery_name
-        if not gallery_name:
-            raise ApplicationExit("'gallery_name' not specified")
-        try:
-            self.az_compute.galleries.begin_delete(resource_group, gallery_name)
-        except Exception as exc:
-            caught = laaso.msapicall.Caught(exc)
-            if caught.is_missing():
-                return
-            raise
-
-    @command.printable
-    def image_gallery_get(self, resource_group=None, gallery_name=None):
-        '''
-        Return info for the named image gallery
-        '''
-        resource_group = resource_group or self.resource_group or self.vm_image_resource_group
-        if not resource_group:
-            raise ApplicationExit("'resource_group' not specified")
-        gallery_name = gallery_name or self.gallery_name
-        if not gallery_name:
-            raise ApplicationExit("'gallery_name' not specified")
-        try:
-            return self.az_compute.galleries.get(resource_group, gallery_name)
-        except Exception as exc:
-            caught = laaso.msapicall.Caught(exc)
-            if caught.is_missing():
-                return None
-            raise
-
-    @command.printable
-    def image_gallery_definition_get(self, resource_group=None, gallery_name=None, definition_name=None):
-        '''
-        Return info for the named image definition
-        '''
-        resource_group = resource_group or self.resource_group or self.vm_image_resource_group
-        if not resource_group:
-            raise ApplicationExit("'resource_group' not specified")
-        gallery_name = gallery_name or self.gallery_name
-        if not gallery_name:
-            raise ApplicationExit("'gallery_name' not specified")
-        definition_name = definition_name or self.vm_image_name
-        if not definition_name:
-            raise ApplicationExit("'definition_name' not specified")
-        try:
-            return self.az_compute.gallery_images.get(resource_group, gallery_name, definition_name)
-        except Exception as exc:
-            caught = laaso.msapicall.Caught(exc)
-            if caught.is_missing():
-                return None
-            raise
-
-    @command.simple
-    def image_gallery_definition_delete(self, resource_group=None, gallery_name=None, definition_name=None, wait=True):
-        '''
-        Delete the named image definition
-        '''
-        resource_group = resource_group or self.resource_group or self.vm_image_resource_group
-        if not resource_group:
-            raise ApplicationExit("'resource_group' not specified")
-        gallery_name = gallery_name or self.gallery_name
-        if not gallery_name:
-            raise ApplicationExit("'gallery_name' not specified")
-        definition_name = definition_name or self.vm_image_name
-        if not definition_name:
-            raise ApplicationExit("'definition_name' not specified")
-        poller = self.arm_poller(self.az_compute.gallery_images)
-        try:
-            op = self.az_compute.gallery_images.begin_delete(resource_group, gallery_name, definition_name, polling=poller)
-        except Exception as exc:
-            caught = laaso.msapicall.Caught(exc)
-            if caught.is_missing():
-                return None
-            raise
-        if wait:
-            op.wait()
-        return op
-
-    @command.printable
-    def image_gallery_version_delete(self, resource_group=None, gallery_name=None, definition_name=None, version=None, wait=True):
-        '''
-        Delete the named image version (single image under a definition)
-        '''
-        resource_group = resource_group or self.resource_group or self.vm_image_resource_group
-        if not resource_group:
-            raise ApplicationExit("'resource_group' not specified")
-        gallery_name = gallery_name or self.gallery_name
-        if not gallery_name:
-            raise ApplicationExit("'gallery_name' not specified")
-        vm_image_name = definition_name or self.vm_image_name
-        if not vm_image_name:
-            raise ApplicationExit("'vm_image_name' not specified for %s" % getframename(0))
-        vm_image_version = str(version) or self.vm_image_version
-        if not vm_image_version:
-            raise ApplicationExit("'vm_image_version' not specified")
-        poller = self.arm_poller(self.az_compute.gallery_image_versions)
-        try:
-            op = self.az_compute.gallery_image_versions.begin_delete(resource_group, gallery_name, vm_image_name, vm_image_version, polling=poller)
-        except Exception as exc:
-            caught = laaso.msapicall.Caught(exc)
-            if caught.is_missing():
-                return None
-            raise
-        if wait:
-            op.wait()
-        return op
-
-    @staticmethod
-    def image_gallery_name_valid(name):
-        '''
-        Return whether name is valid for an image gallery
-        '''
-        if not isinstance(name, str):
-            return False
-        return bool(RE_GALLERY_NAME_ABS.search(name))
-
-    @staticmethod
-    def resource_group_name_valid(name):
-        '''
-        Return whether name is valid for a resource_group
-        '''
-        if not isinstance(name, str):
-            return False
-        return bool(RE_RESOURCE_GROUP_ABS.search(name))
-
-    @staticmethod
-    def subscription_id_valid(name):
-        '''
-        Return whether name is a valid subscription_id
-        '''
-        if not isinstance(name, str):
-            return False
-        return bool(RE_UUID_ABS.search(name))
+    STORAGE_OP_BUNDLE_CLASS = StorageOpBundle
 
     @command.printable
     def storage_account_resource_group_name_get(self, storage_account_name=None):
@@ -2899,7 +2328,7 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
         if not storage_account_resource_group_name:
             return None
         try:
-            keys_obj = self.az_storage.storage_accounts.list_keys(storage_account_resource_group_name, storage_account_name)
+            keys_obj = self._az_storage_client.storage_accounts.list_keys(storage_account_resource_group_name, storage_account_name)
         except Exception as exc:
             caught = laaso.msapicall.Caught(exc)
             if caught.is_missing():
@@ -2910,100 +2339,156 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
             output_redact('SA-KEY:'+storage_account_name, sk)
         return ret
 
-    @command.printable
-    def storage_account_blob_url(self, storage_account_name=None):
+    def storage_op_bundle_get(self, name, *args, skc=None, storage_account_resource_group_name=None, storage_account_key=None, sas_token=None, credential=None, **kwargs) -> StorageOpBundle:
         '''
-        Given a storage account name, return the corresponding URL
-        '''
-        storage_account_name = storage_account_name or self.storage_account_name
-        if not storage_account_name:
-            raise ApplicationExit("'storage_account_name' not specified")
-        return "https://%s.blob.%s/" % (storage_account_name, self.cloud.suffixes.storage_endpoint)
-
-    def _blobserviceclient_get__url_is_valid(self, url):
-        '''
-        Return whether the given URL is valid for blobserviceclient_get
-        '''
-        try:
-            msapicall(self.logger, requests.get, url=url)
-            return True
-        except requests.exceptions.ConnectionError:
-            return False
-
-    def blobserviceclient_get(self, storage_account_name=None, storage_account_resource_group_name=None, storage_account_key=None, sas_token=None, credential=None):
-        '''
-        Create and return a BlobServiceClient for the given storage account.
-        If storage_account_key is not given, it is retrieved.
-        https://docs.microsoft.com/en-us/python/api/azure-storage-blob/azure.storage.blob.blobserviceclient?view=azure-python
-        '''
-        # See https://pypi.org/project/azure-storage-blob/
-        storage_account_name = storage_account_name or self.storage_account_name
-        if not storage_account_name:
-            raise ApplicationExit("'storage_account_name' not specified")
-        blob_url = self.storage_account_blob_url(storage_account_name=storage_account_name)
-        # The SDK does not deal well with invalid storage account names.
-        # See if we can reach blob_url (does not matter that we will most likely get a 400).
-        if not self._blobserviceclient_get__url_is_valid(blob_url):
-            self.logger.warning("%s: invalid blob_url %r", self.mth(), blob_url)
-            return None
-        bsc_kwargs = dict()
-        if credential:
-            bsc_kwargs['credential'] = credential
-        elif sas_token:
-            bsc_kwargs['credential'] = sas_token
-        elif storage_account_key:
-            bsc_kwargs['credential'] = storage_account_key
-        else:
-            # No auth provided. If we can retrieve SA keys, use one. If not, try using our own creds.
-            # Most likely our own creds will fail in that case. Sorry.
-            cred = self.azure_credential_generate()
-            keys = self.storage_account_keys_get(storage_account_name=storage_account_name, storage_account_resource_group_name=storage_account_resource_group_name)
-            if keys and keys[0]:
-                bsc_kwargs['credential'] = keys[0]
-            else:
-                bsc_kwargs['credential'] = cred
-        ret = msapicall(self.logger, BlobServiceClient, blob_url, **bsc_kwargs)
-        if not ret:
-            self.logger.warning("%s: returning BlobServiceClient %r", self.mth(), ret)
-        return ret
-
-    def blobop_bundle_get(self, name, *args, skc=None, storage_account_resource_group_name=None, storage_account_key=None, sas_token=None, credential=None, **kwargs):
-        '''
-        Return a BlobOpBundle. Hint this manager to the bundle if no
+        Return a StorageOpBundle. Hint this manager to the bundle if no
         manager is provided in kwargs.
         '''
+        assert issubclass(self.STORAGE_OP_BUNDLE_CLASS, StorageOpBundle)
+        kwargs.setdefault('logger', self.logger)
         kwargs.setdefault('manager', self)
         if skc:
             if (not storage_account_key) and (not sas_token) and (not credential):
                 storage_account_key = skc.retrieve_one(name, manager=self)
             if not storage_account_resource_group_name:
                 storage_account_resource_group_name = skc.rg_for(name.subscription_id, name.storage_account_name, manager=self)
-        ret = BlobOpBundle(name, *args, storage_account_resource_group_name=storage_account_resource_group_name, storage_account_key=storage_account_key, sas_token=sas_token, credential=credential, **kwargs)
-        assert id(ret.logger) == id(self.logger)
+        credential_implicit = self.azure_credential_generate()
+        ret = self.STORAGE_OP_BUNDLE_CLASS(name, *args,
+                                           storage_account_resource_group_name=storage_account_resource_group_name,
+                                           storage_account_key=storage_account_key,
+                                           sas_token=sas_token,
+                                           credential_explicit=credential,
+                                           credential_implicit=credential_implicit,
+                                           **kwargs)
+        return ret
+
+    ######################################################################
+    # Deployments
+
+    @command.printable
+    def deployment_get(self, deployment_name, resource_group=None, subscription_id=None, pretty=False):
+        '''
+        retrieve a deployment to list all resource provisioned/deployed
+        '''
+        resource_group = resource_group or self.resource_group
+        if not resource_group:
+            self.logger.error("'resource_group' not specified")
+            raise ApplicationExit(1)
+        subscription_id = subscription_id or self.subscription_id
+        if not subscription_id:
+            self.logger.error("'subscription_id' not specified")
+            raise ApplicationExit(1)
+        az_resource = self._az_resource_get(subscription_id)
+        try:
+            deployment = az_resource.deployments.get(deployment_name=deployment_name, resource_group_name=resource_group)
+        except Exception as exc:
+            caught = laaso.msapicall.Caught(exc)
+            self.logger.info('exception raised while deploying %r in RG %r', deployment_name, resource_group)
+            if caught.is_missing():
+                return None
+            raise
+        if not pretty:
+            return deployment
+        ret = {'additional_properties' : deployment.additional_properties,
+               'id' : deployment.id,
+               'location' : deployment.location,
+               'name' : deployment.name,
+               'correlation_id' : deployment.properties.correlation_id,
+               'error' : deployment.properties.error,
+               'output_resources': deployment.properties.output_resources,
+               'provisioning_state' : deployment.properties.provisioning_state,
+               'timestamp' : deployment.properties.timestamp.strftime('%Y-%m-%d %H:%M:%S.%f'),
+              }
         return ret
 
     @command.printable
-    def vnet_gateway_get(self, vnet_gateway_name=None, resource_group=None):
+    def deployments_list_failed_by_resource_group(self, resource_group=None, pretty=False):
         '''
-        Return a VirtualNetworkGateway or None for not-found
+        Retrieve failed deployments for the given resource_group
         '''
-        vnet_gateway_name = vnet_gateway_name or self.vnet_gateway_name
-        if not vnet_gateway_name:
-            raise ApplicationExit("'vnet_gateway_name' not specified")
         resource_group = resource_group or self.resource_group
         if not resource_group:
-            raise ApplicationExit("'resource_group' not specified")
+            self.logger.error("'resource_group' not specified")
+            raise ApplicationExit(1)
         try:
-            return self.az_network.virtual_network_gateways.get(resource_group, vnet_gateway_name)
+            deployments = [x for x in self._az_resource_client.deployments.list_by_resource_group(resource_group) if x.properties.error is not None]
         except Exception as exc:
             caught = laaso.msapicall.Caught(exc)
             if caught.is_missing():
                 return None
             raise
+        if not pretty:
+            return deployments
+        ret = list()
+        for d in deployments:
+            ret.append({'additional_properties' : d.additional_properties,
+                        'id' : d.id,
+                        'location' : d.location,
+                        'name' : d.name,
+                        'correlation_id' : d.properties.correlation_id,
+                        'error' : d.properties.error,
+                        'provisioning_state' : d.properties.provisioning_state,
+                        'timestamp' : d.properties.timestamp.strftime('%Y-%m-%d %H:%M:%S.%f'),
+                       })
+        return ret
+
+    @command.simple
+    def deployments_log_failed_by_resource_group(self, resource_group=None, logger=None, log_level=logging.ERROR, pretty=False):
+        '''
+        Retrieve failed deployments for the given resource_group and log them.
+        Log and swallow Exceptions.
+        '''
+        logger = logger if logger is not None else self.logger
+        resource_group = resource_group or self.resource_group
+        if not resource_group:
+            self.logger.error("'resource_group' not specified")
+            raise ApplicationExit(1)
+        try:
+            failures = self.deployments_list_failed_by_resource_group(resource_group=resource_group, pretty=pretty)
+        except Exception as exc:
+            logger.error("cannot retrieve deployments for resource_group %r: %r\n%s",
+                         resource_group, exc, expand_item_pformat(exc))
+            return
+        if failures is None:
+            logger.log(log_level, "cannot retrieve deployments for resource_group %r because it does not exist",
+                       resource_group)
+            return
+        if not failures:
+            logger.log(log_level, "no failed deployments for resource_group %r",
+                       resource_group)
+            return
+        s = ' (simplified)' if pretty else ''
+        logger.log(log_level, "failed deployments%s for resource_group %r:\n%s",
+                   s, resource_group, expand_item_pformat(failures))
+
+    # Cap the periodicity of the poller used for create_or_update operations.
+    # The tension here is between slow deployments because we sleep too
+    # long after they finish versus having the polling operations get throttled
+    # because we poll too often or because there's too much overall
+    # traffic in the subscriptions.
+    DEPLOYMENT_DELAY_MIN = 20
+    DEPLOYMENT_DELAY_MAX = 20
+
+    def deployment_create_or_update(self, resource_group, deployment_name, parameters):
+        '''
+        Create or update a deployment. Returns LRO polling object.
+        '''
+        az_resource = self._az_resource_client
+        poller = self.arm_poller(az_resource.deployments)
+        assert hasattr(poller, 'laaso_min_delay')
+        assert hasattr(poller, 'laaso_max_delay')
+        poller.laaso_min_delay = self.DEPLOYMENT_DELAY_MIN
+        poller.laaso_max_delay = self.DEPLOYMENT_DELAY_MAX
+        deploy_op = az_resource.deployments.begin_create_or_update(resource_group,
+                                                                   deployment_name,
+                                                                   parameters,
+                                                                   polling=poller)
+        return deploy_op
 
     ######################################################################
     # Subscription mgmt
 
+    @command.printable
     def subscription_list(self):
         '''
         List subscriptions available to this auth.
@@ -3017,7 +2502,7 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
         Return a list of azure.mgmt.subscription.models.Subscription.
         '''
         try:
-            return list(self.az_subscription.subscriptions.list())
+            return list(self._az_subscription_client.subscriptions.list())
         except Exception as exc:
             caught = laaso.msapicall.Caught(exc)
             if caught.is_missing():
@@ -3038,63 +2523,6 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
         return None
 
     ######################################################################
-    # VM mgmt
-
-    VM_AZRID_VALUES = {'provider_name' : 'Microsoft.Compute',
-                       'resource_type' : 'virtualMachines',
-                      }
-
-    @classmethod
-    def vm_azrid_build(cls, subscription_id, resource_group, resource_name):
-        '''
-        Build azrid
-        '''
-        return AzResourceId.build(subscription_id, resource_group, resource_name, cls.VM_AZRID_VALUES)
-
-    @classmethod
-    def vm_azrid(cls, resource_id):
-        '''
-        Return resource_id in AzResourceId form.
-        '''
-        return azrid_normalize(resource_id, AzResourceId, cls.VM_AZRID_VALUES)
-
-    @classmethod
-    def is_vm_resource_id(cls, resource_id):
-        '''
-        Return whether resource_id is a VM resource_id
-        '''
-        azrid = azrid_normalize_or_none(resource_id, AzResourceId, cls.VM_AZRID_VALUES)
-        return azrid and azrid_is(azrid, AzResourceId, **cls.VM_AZRID_VALUES)
-
-    @command.printable
-    def vm_list(self, subscription_id=None, resource_group=None):
-        '''
-        List virtual machines in a subscription. If not specified explicitly, self.subscription_id is used.
-        May optionally limit to a resource_group.
-        Return a list of azure.mgmt.compute.models.VirtualMachine
-        '''
-        subscription_id = laaso.subscription_mapper.effective(subscription_id or self.subscription_id)
-        resource_group = resource_group or None
-        return self._vm_list(subscription_id, resource_group)
-
-    def _vm_list(self, subscription_id, resource_group):
-        '''
-        List virtual machines in a subscription.
-        If resource_group is truthy, restrict the list to the named RG.
-        Return a list of azure.mgmt.compute.models.VirtualMachine
-        '''
-        az_compute = self.az_compute_get(subscription_id)
-        try:
-            if resource_group:
-                return list(az_compute.virtual_machines.list(resource_group))
-            return list(az_compute.virtual_machines.list_all())
-        except Exception as exc:
-            caught = laaso.msapicall.Caught(exc)
-            if caught.is_missing():
-                return list()
-            raise
-
-    ######################################################################
     # loganalytics_workspace
 
     LOGANALYTICS_WORKSPACE_AZRID_VALUES = {'provider_name' : 'Microsoft.OperationalInsights',
@@ -3102,14 +2530,14 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
                                           }
 
     @classmethod
-    def loganalytics_workspace_azrid(cls, resource_id):
+    def loganalytics_workspace_azrid(cls, resource_id) -> AzResourceId:
         '''
         Return resource_id in AzResourceId form.
         '''
         return azrid_normalize(resource_id, AzResourceId, cls.LOGANALYTICS_WORKSPACE_AZRID_VALUES)
 
     @classmethod
-    def loganalytics_workspace_resource_type(cls):
+    def loganalytics_workspace_resource_type(cls) -> str:
         '''
         Return the resource type string - eg x.type where x is the SDK resource obj.
         '''
@@ -3117,7 +2545,7 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
         return f"{v['provider_name']}/{v['resource_type']}"
 
     @classmethod
-    def loganalytics_workspace_obj_normalize(cls, obj):
+    def loganalytics_workspace_obj_normalize(cls, obj:azure.mgmt.loganalytics.models.Workspace) -> azure.mgmt.loganalytics.models.Workspace:
         '''
         The OperationalInsights RP returns some strings with
         nonstandard and even inconsistent case. Normalize
@@ -3135,7 +2563,7 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
         Return azure.mgmt.loganalytics.models.Workspace or None
         '''
         try:
-            az_loganalytics = self.az_loganalytics_get(azrid.subscription_id)
+            az_loganalytics = self._az_loganalytics_get(azrid.subscription_id)
             return az_loganalytics.workspaces.get(azrid.resource_group_name, azrid.resource_name)
         except Exception as exc:
             caught = laaso.msapicall.Caught(exc)
@@ -3171,7 +2599,7 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
         Return azure.mgmt.loganalytics.models.SharedKeys or None
         '''
         try:
-            az_loganalytics = self.az_loganalytics_get(azrid.subscription_id)
+            az_loganalytics = self._az_loganalytics_get(azrid.subscription_id)
             return az_loganalytics.shared_keys.get_shared_keys(azrid.resource_group_name, azrid.resource_name)
         except Exception as exc:
             caught = laaso.msapicall.Caught(exc)
@@ -3194,9 +2622,109 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
         Create or update for loganalytics workspace
         Returns azure.mgmt.loganalytics.models.Workspace
         '''
-        az_loganalytics = self.az_loganalytics_get(azrid.subscription_id)
+        az_loganalytics = self._az_loganalytics_get(azrid.subscription_id)
         poller = self.arm_poller(az_loganalytics.workspaces)
         op = az_loganalytics.workspaces.begin_create_or_update(azrid.resource_group_name, azrid.resource_name, params, polling=poller)
+        laaso_lro_wait(op, 'loganalytics.workspaces.create_or_update', self.logger)
+        return op.result()
+
+    ######################################################################
+    # storage_account mgmt
+
+    STORAGE_ACCOUNT_AZRID_VALUES = {'provider_name' : 'Microsoft.Storage',
+                                    'resource_type' : 'storageAccounts',
+                                   }
+
+    @classmethod
+    def storage_account_azrid(cls, resource_id) -> AzResourceId:
+        '''
+        Return resource_id in AzResourceId form.
+        '''
+        return azrid_normalize(resource_id, AzResourceId, cls.STORAGE_ACCOUNT_AZRID_VALUES)
+
+    @classmethod
+    def storage_account_azrid_build(cls, subscription_id, resource_group, resource_name) -> AzResourceId:
+        '''
+        Build azrid
+        '''
+        return AzResourceId.build(subscription_id, resource_group, resource_name, cls.STORAGE_ACCOUNT_AZRID_VALUES)
+
+    @classmethod
+    def is_storage_account_resource_id(cls, resource_id) -> bool:
+        '''
+        Return whether resource_id is a storage_account
+        '''
+        azrid = azrid_normalize_or_none(resource_id, AzResourceId, cls.STORAGE_ACCOUNT_AZRID_VALUES)
+        return azrid and azrid_is(azrid, AzResourceId, **cls.STORAGE_ACCOUNT_AZRID_VALUES)
+
+    @classmethod
+    def storage_account_resource_type(cls) -> str:
+        '''
+        Return the resource type string - eg x.type where x is the SDK resource obj.
+        '''
+        v = cls.STORAGE_ACCOUNT_AZRID_VALUES
+        return f"{v['provider_name']}/{v['resource_type']}"
+
+    @classmethod
+    def storage_account_obj_normalize(cls, obj:azure.mgmt.storage.models.StorageAccount) -> azure.mgmt.storage.models.StorageAccount:
+        '''
+        The OperationalInsights RP returns some strings with
+        nonstandard and even inconsistent case. Normalize
+        these strings to a consistent form.
+        '''
+        if obj:
+            obj = copy.deepcopy(obj)
+            obj = cls.sdk_resource_obj_normalize(obj, cls.STORAGE_ACCOUNT_AZRID_VALUES, cls.storage_account_resource_type(), docopy=False)
+            if obj.sku and obj.sku.name:
+                obj.sku.name = laaso.util.enum_str_normalize_nocase(azure.mgmt.storage.models.SkuName, obj.sku.name)
+            if obj.kind:
+                obj.kind = laaso.util.enum_str_normalize_nocase(azure.mgmt.storage.models.Kind, obj.kind)
+        return obj
+
+    def _storage_account_get_properties(self, azrid):
+        '''
+        Return azure.mgmt.storage.models.StorageAccount or None
+        '''
+        try:
+            az_storage = self._az_storage_get(azrid.subscription_id)
+            return az_storage.storage_accounts.get_properties(azrid.resource_group_name, azrid.resource_name)
+        except Exception as exc:
+            caught = laaso.msapicall.Caught(exc)
+            if caught.is_missing():
+                return None
+            raise
+
+    def storage_account_get_by_id(self, resource_id):
+        '''
+        Return azure.mgmt.storage.models.StorageAccount or None
+        '''
+        resource_id = self.storage_account_azrid(resource_id)
+        ret = self._storage_account_get_properties(resource_id)
+        ret = self.storage_account_obj_normalize(ret)
+        return ret
+
+    def storage_account_create(self, azrid, params):
+        '''
+        Create for a storage account.
+        Returns azure.mgmt.storage.models.StorageAccount
+        '''
+        azrid.values_sanity(self.STORAGE_ACCOUNT_AZRID_VALUES)
+        ret = self._storage_account_create(azrid, params)
+        ret = self.storage_account_obj_normalize(ret)
+        return ret
+
+    def _storage_account_create(self, azrid, params):
+        '''
+        Create for storage account
+        Returns azure.mgmt.storage.models.StorageAccount
+        '''
+        sa_params = StorageAccountCreateParameters(sku=azure.mgmt.storage.models.Sku(name=params['sku']['name']),
+                                                   kind=azure.mgmt.storage.models.Kind(params['kind']),
+                                                   location=params['location'],
+                                                   tags=params.get('tags', None))
+        az_storage = self._az_storage_get(azrid.subscription_id)
+        poller = self.arm_poller(az_storage.storage_accounts)
+        op = az_storage.storage_accounts.begin_create(azrid.resource_group_name, azrid.resource_name, sa_params, polling=poller)
         op.wait()
         return op.result()
 
@@ -3209,11 +2737,18 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
                                            }
 
     @classmethod
-    def virtual_network_peering_azrid(cls, resource_id):
+    def virtual_network_peering_azrid(cls, resource_id) -> AzSubResourceId:
         '''
         Given a virtual network peering (peering_id), return it in AzSubResourceId form.
         '''
         return azrid_normalize(resource_id, AzSubResourceId, cls.VIRTUAL_NETWORK_PEERING_AZRID_VALUES)
+
+    @classmethod
+    def is_virtual_network_peering_resource_id(cls, resource_id) -> bool:
+        '''
+        Return whether resource_id is a virtual network peering
+        '''
+        return bool(azrid_normalize_or_none(resource_id, AzSubResourceId, cls.VIRTUAL_NETWORK_PEERING_AZRID_VALUES))
 
     def virtual_network_peering_get_by_id(self, peering_id):
         '''
@@ -3227,7 +2762,7 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
         '''
         Return azure.mgmt.network.models.VirtualNetworkPeering or None
         '''
-        az_network = self.az_network_get(peering_azrid.subscription_id)
+        az_network = self._az_network_get(peering_azrid.subscription_id)
         try:
             return az_network.virtual_network_peerings.get(peering_azrid.resource_group_name, peering_azrid.resource_name, peering_azrid.subresource_name)
         except Exception as exc:
@@ -3248,9 +2783,9 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
         '''
         Create a single vnet peering. Returns azure.mgmt.network.models.VirtualNetworkPeering.
         '''
-        poller = self.arm_poller(self.az_network.virtual_network_peerings)
-        op = self.az_network.virtual_network_peerings.begin_create_or_update(resource_group, vnet_name, peering_name, params, polling=poller)
-        op.wait()
+        poller = self.arm_poller(self._az_network_client.virtual_network_peerings)
+        op = self._az_network_client.virtual_network_peerings.begin_create_or_update(resource_group, vnet_name, peering_name, params, polling=poller)
+        laaso_lro_wait(op, 'network.virtual_network_peerings.create_or_update', self.logger)
         return op.result()
 
     ######################################################################
@@ -3262,11 +2797,18 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
                                           }
 
     @classmethod
-    def subnet_azrid(cls, resource_id):
+    def subnet_azrid(cls, resource_id) -> AzSubResourceId:
         '''
         Return resource_id in AzSubResourceId form.
         '''
         return azrid_normalize(resource_id, AzSubResourceId, cls.VIRTUAL_NETWORK_SUBNET_AZRID_VALUES)
+
+    @classmethod
+    def is_subnet_resource_id(cls, resource_id) -> bool:
+        '''
+        Return whether resource_id is a subnet
+        '''
+        return bool(azrid_normalize_or_none(resource_id, AzSubResourceId, cls.VIRTUAL_NETWORK_SUBNET_AZRID_VALUES))
 
     def subnet_name_get(self, vnet_name=None, subnet_name=None, vnet_resource_group_name=None):
         '''
@@ -3300,7 +2842,7 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
         '''
         Return azure.mgmt.network.models.Subnet or None
         '''
-        az_network = self.az_network_get(subscription_id)
+        az_network = self._az_network_get(subscription_id)
         try:
             return az_network.subnets.get(resource_group, vnet_name, subnet_name)
         except Exception as exc:
@@ -3320,10 +2862,10 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
         '''
         Return azure.mgmt.network.models.Subnet
         '''
-        az_network = self.az_network_get(azrid.subscription_id)
+        az_network = self._az_network_get(azrid.subscription_id)
         poller = self.arm_poller(az_network.subnets)
         op = az_network.subnets.begin_create_or_update(azrid.resource_group_name, azrid.resource_name, azrid.subresource_name, params, polling=poller)
-        op.wait()
+        laaso_lro_wait(op, 'network.subnets.create_or_update', self.logger)
         return op.result()
 
     ######################################################################
@@ -3340,12 +2882,131 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
     ######################################################################
     # resource_group
 
+    # Shared across instances so that different threads/applications
+    # using different managers serialize against one another.
+    _resource_group_create_lock = threading.RLock()
+
+    @property
+    def resource_group_create_lock(self):
+        '''
+        Getter
+        '''
+        return self._resource_group_create_lock
+
     def _resource_group_create_or_update(self, resource_group, parameters):
         '''
         Perform the resource_group create_or_update.
         Return azure.mgmt.resource.resources.models.ResourceGroup.
         '''
-        return self.az_resource.resource_groups.create_or_update(resource_group, parameters)
+        return self._az_resource_client.resource_groups.create_or_update(resource_group, parameters)
+
+    @command.simple
+    def resource_group_create_iff_necessary(self, resource_group=None, location=None, tags=None):
+        '''
+        Create resource_group
+        '''
+        resource_group = resource_group or self.resource_group
+        if not resource_group:
+            raise ApplicationExit("'resource_group' not specified")
+        with self.resource_group_create_lock:
+            resource_group_obj = self.resource_group_get(resource_group=resource_group)
+            if resource_group_obj:
+                self.logger.debug("resource_group %s already exists", resource_group)
+                return resource_group_obj
+            ret = self.resource_group_create(resource_group=resource_group, location=location, tags=tags)
+            self.logger.debug("created resource_group %s", resource_group)
+            return ret
+
+    _resource_groups_created_or_updated = set()
+
+    @classmethod
+    def resource_groups_created_or_updated_get(cls):
+        '''
+        Getter
+        '''
+        return set(cls._resource_groups_created_or_updated)
+
+    @command.simple
+    def resource_group_create(self, resource_group=None, location=None, tags=None):
+        '''
+        Create resource_group. Return azure.mgmt.resource.resources.models.ResourceGroup.
+        '''
+        resource_group = resource_group or self.resource_group
+        location = location or self.location
+        if not resource_group:
+            self.logger.error("'resource_group' not specified")
+            raise ApplicationExit(1)
+        tags = self.tags_get(tags)
+        tags.setdefault('time_create', datetime.datetime.utcnow().isoformat(sep=' '))
+        parameters = {'location': location,
+                      'tags': tags,
+                      }
+        self.logger.info("create resource_group %s with parameters:\n%s", resource_group, expand_item_pformat(parameters))
+        azrid = AzRGResourceId(self.subscription_id, resource_group)
+        res = self._resource_group_create_or_update(resource_group, parameters)
+        self.logger.info("resource_group %s create result:\n%s", resource_group, expand_item_pformat(res))
+        if res:
+            self._resource_groups_created_or_updated.add(azrid)
+        return res
+
+    @command.wait
+    def resource_group_delete(self, resource_group, wait=False, verbose=True):
+        '''
+        Issue resource group delete and return the op. Returns None
+        if the resource_group does not exist.
+        '''
+        if not resource_group:
+            raise ApplicationExit("'resource_group' not specified")
+        azrid = AzRGResourceId(self.subscription_id, resource_group)
+        rgl = azrid.resource_group_name.lower()
+        if rgl.endswith('-infra') or ('-infra-' in rgl) or any(rgl == x.lower() for x in laaso.scfg.tget('resource_groups_keep', tuple)):
+            raise ResourceGroupMayNotBeDeleted(f"policy forbids deleting resource_group {resource_group!r}")
+        rg = self._resource_group_get(azrid)
+        if not rg:
+            if verbose:
+                self.logger.info("no need to delete resource group %s", azrid)
+            return None
+        if rg.tags and rg.tags.get(RG_KEEP_TAG_KEY, ''):
+            raise ResourceGroupMayNotBeDeleted(f"tag {RG_KEEP_TAG_KEY!r} forbids deleting resource_group {azrid}")
+        if verbose:
+            self.logger.info("delete resource group %s", azrid)
+        try:
+            op = self._resource_group_delete_begin(azrid)
+            # Do the wait in this block to get the logging
+            if wait:
+                self.resource_group_delete_op_wait(resource_group, op, verbose=verbose)
+        except Exception as exc:
+            caught = laaso.msapicall.Caught(exc)
+            if caught.is_missing():
+                if verbose:
+                    self.logger.info("resource group %s does not exist", resource_group)
+                return None
+            self.logger.warning("cannot delete resource group %r [%s]: %r", resource_group, caught.reason(), exc)
+            raise
+        return op
+
+    def _resource_group_delete_begin(self, azrid):
+        '''
+        Begin deleting the given resource group.
+        Returns LRO polling object.
+        Raises on error, including no-such-RG.
+        Is allowed to return None for synchronous completion or no-such-RG, but
+        does not do so here.
+        '''
+        az_resource = self._az_resource_get(azrid.subscription_id)
+        poller = self.arm_poller(az_resource.resource_groups)
+        poller.laaso_min_delay = self.VM_STOP_DELAY_MIN
+        return az_resource.resource_groups.begin_delete(azrid.resource_group_name, polling=poller)
+
+    def resource_group_delete_op_wait(self, resource_group, op, verbose=True):
+        '''
+        Wait for a resource_group_delete operation to complete
+        '''
+        if verbose:
+            self.logger.info("wait for resource group %s delete", resource_group)
+        laaso_lro_wait(op, 'resource.resource_groups.delete', self.logger)
+        if verbose:
+            self.logger.info("resource group %s deleted", resource_group)
 
     ######################################################################
     # NSG (Network Security Group)
@@ -3355,7 +3016,14 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
                        }
 
     @classmethod
-    def nsg_azrid_build(cls, subscription_id, resource_group, resource_name):
+    def nsg_azrid(cls, resource_id) -> AzResourceId:
+        '''
+        Return resource_id in AzResourceId form.
+        '''
+        return azrid_normalize(resource_id, AzResourceId, cls.NSG_AZRID_VALUES)
+
+    @classmethod
+    def nsg_azrid_build(cls, subscription_id, resource_group, resource_name) -> AzResourceId:
         '''
         Build azrid
         '''
@@ -3379,7 +3047,7 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
         Return azure.mgmt.network.models.NetworkSecurityGroup or None
         '''
         try:
-            return self.az_network.network_security_groups.get(resource_group, nsg_name)
+            return self._az_network_client.network_security_groups.get(resource_group, nsg_name)
         except Exception as exc:
             caught = laaso.msapicall.Caught(exc)
             if caught.is_missing():
@@ -3408,10 +3076,10 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
         Issue a create_or_update for the given network security group.
         Return azure.mgmt.network.models.NetworkSecurityGroup.
         '''
-        az_network = self.az_network_get(azrid.subscription_id)
+        az_network = self._az_network_get(azrid.subscription_id)
         poller = self.arm_poller(az_network.network_security_groups)
         op = az_network.network_security_groups.begin_create_or_update(azrid.resource_group_name, azrid.resource_name, params, polling=poller)
-        op.wait()
+        laaso_lro_wait(op, 'network.network_security_groups.create_or_update', self.logger)
         return op.result()
 
     ######################################################################
@@ -3422,7 +3090,7 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
                                    }
 
     @classmethod
-    def virtual_network_azrid(cls, resource_id):
+    def virtual_network_azrid(cls, resource_id) -> AzResourceId:
         '''
         Return resource_id in AzResourceId form.
         '''
@@ -3462,7 +3130,7 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
         '''
         Return vnet object (azure.mgmt.network.models.VirtualNetwork) or None
         '''
-        az_network = self.az_network_get(subscription_id)
+        az_network = self._az_network_get(subscription_id)
         try:
             return az_network.virtual_networks.get(resource_group, vnet_name)
         except Exception as exc:
@@ -3482,16 +3150,16 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
         '''
         azure.mgmt.network.models.VirtualNetwork
         '''
-        az_network = self.az_network_get(azrid.subscription_id)
+        az_network = self._az_network_get(azrid.subscription_id)
         poller = self.arm_poller(az_network.subnets)
         op = az_network.virtual_networks.begin_create_or_update(azrid.resource_group_name, azrid.resource_name, params, polling=poller)
-        op.wait()
+        laaso_lro_wait(op, 'network.virtual_networks.create_or_update', self.logger)
         return op.result()
 
     ######################################################################
     # Resource IDs
 
-    def resource_id_expand(self, resource_ids, exc_value=None, namestack=''):
+    def resource_id_expand(self, resource_ids, exc_value=None, namestack='') -> list:
         '''
         Given resource_ids as a str or list of str, return a list of
         resource IDs resulting from expanding wildcards.
@@ -3517,38 +3185,49 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
     ######################################################################
     # Resources
 
-    def resource_list(self, resource_type_match=None):
+    def resource_list(self, resource_group='', resource_type_match='') -> list:
         '''
         Return a list of azure.mgmt.resource.resources.models.GenericResourceExpanded objects.
         '''
-        return self._resource_list(resource_type_match)
+        return self._resource_list(resource_group, resource_type_match)
 
-    def _resource_list(self, resource_type_match):
+    def _resource_list(self, resource_group, resource_type_match) -> list:
         '''
         List all resources in this subscription, returning a list of type azure.mgmt.resource.resources.models.GenericResourceExpanded
         '''
         lfilter = "resourceType eq %r" % resource_type_match if resource_type_match else None
         try:
-            return list(self.az_resource.resources.list(filter=lfilter))
+            if resource_group:
+                return list(self._az_resource_client.resources.list_by_resource_group(resource_group, filter=lfilter))
+            return list(self._az_resource_client.resources.list(filter=lfilter))
         except Exception as exc:
             caught = laaso.msapicall.Caught(exc)
             if caught.is_missing():
                 return list()
             raise
 
-    def resource_list_storage_accounts(self):
+    def resource_list_storage_accounts(self) -> list:
         '''
         Return a list of all storage accounts in the default subscription.
         Returns an empty list (not None) if the subscription does not exist.
         This trivial wrappper provides a useful hook for testing (mocking).
         '''
-        return self.resource_list('Microsoft.Storage/storageAccounts')
+        return self.resource_list(resource_type_match=f"{self.STORAGE_ACCOUNT_AZRID_VALUES['provider_name']}/{self.STORAGE_ACCOUNT_AZRID_VALUES['resource_type']}")
+
+    @staticmethod
+    def resource_provisioning_state(obj):
+        '''
+        Return the provisioning state of an arbitrary object or None if not known
+        '''
+        if isinstance(obj, azure.mgmt.resource.resources.models.ResourceGroup):
+            return obj.properties.provisioning_state
+        return getattr(obj, 'provisioning_state', None)
 
     ######################################################################
     # RBAC role assignments
 
     @staticmethod
-    def rbac_role_assignment_normalize(obj):
+    def rbac_role_assignment_normalize(obj) -> azure.mgmt.authorization.v2018_01_01_preview.models.RoleAssignment:
         '''
         Handle converting preview API results.
         Returns azure.mgmt.authorization.v2018_01_01_preview.models.RoleAssignment.
@@ -3586,7 +3265,7 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
         Restrict to at or above the scope: lfilter='atScope()'
         Restrict to a specific principal_id: lfilter='principalId eq {id}'
         '''
-        az_authorization = self.az_authorization_get(azrid.subscription_id)
+        az_authorization = self._az_authorization_get(azrid.subscription_id)
         return list(az_authorization.role_assignments.list_for_scope(str(azrid), filter=lfilter))
 
     def rbac_role_assignment_create(self, principal_id, principal_type, scope, role_definition_id):
@@ -3610,7 +3289,7 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
                                                                                                         role_definition_id=role_definition_id,
                                                                                                        )
         try:
-            self.az_authorization.role_assignments.create(scope, name, parameters)
+            self._az_authorization_client.role_assignments.create(scope, name, parameters)
         except azure.core.exceptions.ResourceExistsError as exc:
             caught = laaso.msapicall.Caught(exc)
             if caught.any_code_matches('RoleAssignmentExists'):
@@ -3636,7 +3315,7 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
           type eq 'BuiltInRole|CustomRole'
         '''
         subscription_id = azrid.subscription_id or self.subscription_id
-        az_authorization = self.az_authorization_get(subscription_id)
+        az_authorization = self._az_authorization_get(subscription_id)
         return list(az_authorization.role_definitions.list(str(azrid), filter=lfilter))
 
     def rbac_role_definition_get_by_id(self, definition_id):
@@ -3657,7 +3336,7 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
         Takes definition_azrid rather than definition_id to make mocking simpler and more efficient.
         '''
         try:
-            return self.az_authorization.role_definitions.get_by_id(str(definition_azrid))
+            return self._az_authorization_client.role_definitions.get_by_id(str(definition_azrid))
         except Exception as exc:
             caught = laaso.msapicall.Caught(exc)
             if caught.is_missing():
@@ -3760,11 +3439,18 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
                             }
 
     @classmethod
-    def keyvault_azrid(cls, resource_id):
+    def keyvault_azrid(cls, resource_id) -> AzResourceId:
         '''
         Return resource_id in AzResourceId form.
         '''
         return azrid_normalize(resource_id, AzResourceId, cls.KEYVAULT_AZRID_VALUES)
+
+    @classmethod
+    def keyvault_azrid_build(cls, subscription_id, resource_group, resource_name) -> AzResourceId:
+        '''
+        Build azrid
+        '''
+        return AzResourceId.build(subscription_id, resource_group, resource_name, cls.KEYVAULT_AZRID_VALUES)
 
     @command.printable
     def keyvault_get(self, subscription_id=None, resource_group=None, vault_name=None):
@@ -3787,7 +3473,7 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
         '''
         Fetch and return Vault or None
         '''
-        az_keyvault_mgmt = self.az_keyvault_mgmt_get(azrid.subscription_id)
+        az_keyvault_mgmt = self._az_keyvault_mgmt_get(azrid.subscription_id)
         try:
             return az_keyvault_mgmt.vaults.get(azrid.resource_group_name, azrid.resource_name)
         except Exception as exc:
@@ -3816,9 +3502,10 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
         Create a keyvault
         Return azure.mgmt.keyvault.models.Vault
         '''
-        poller = self.arm_poller(self.az_keyvault_mgmt.vaults)
-        op = self.az_keyvault_mgmt.vaults.begin_create_or_update(resource_group, resource_name, params, polling=poller)
-        op.wait()
+        poller = self.arm_poller(self._az_keyvault_mgmt_client.vaults)
+        poller.laaso_min_delay = 10
+        op = self._az_keyvault_mgmt_client.vaults.begin_create_or_update(resource_group, resource_name, params, polling=poller)
+        laaso_lro_wait(op, 'keyvault_mgmt.vaults.create_or_update', self.logger)
         return op.result()
 
     ######################################################################
@@ -4102,7 +3789,7 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
         keyvault_name = keyvault_name or self.pubkey_keyvault_name or laaso.scfg.get('pubkey_keyvault_name', '')
         if not keyvault_name:
             raise self.exc_value("'pubkey_keyvault_name' not specified")
-        keyvault_client_id = keyvault_client_id or self.pubkey_keyvault_client_id or laaso.scfg.get('pubkey_keyvault_client_id', '')
+        keyvault_client_id = keyvault_client_id or self.pubkey_keyvault_client_id or self.subscription_value_get("pubkeyKeyVaultClientId", "")
         if keyvault_client_id:
             # Attempt both the provided client_id and default credentials
             client_id = [keyvault_client_id, None]
@@ -4239,7 +3926,8 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
         if headers:
             req_headers.update(headers)
 
-        resp = msapicall(self.logger, requests.get, url, headers=req_headers, params=p)
+        with requests.Session() as session:
+            resp = msapicall(self.logger, session.get, url, headers=req_headers, params=p)
         return resp
 
     @command.printable
@@ -4471,14 +4159,21 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
                         }
 
     @classmethod
-    def user_assigned_identity_azrid(cls, resource_id):
+    def user_assigned_identity_azrid(cls, resource_id) -> AzResourceId:
         '''
         Return resource_id in AzResourceId form.
         '''
         return azrid_normalize(resource_id, AzResourceId, cls.UAMI_AZRID_VALUES)
 
     @classmethod
-    def is_uami_resource_id(cls, resource_id):
+    def user_assigned_identity_azrid_build(cls, subscription_id, resource_group, resource_name) -> AzResourceId:
+        '''
+        Build azrid
+        '''
+        return AzResourceId.build(subscription_id, resource_group, resource_name, cls.UAMI_AZRID_VALUES)
+
+    @classmethod
+    def is_uami_resource_id(cls, resource_id) -> bool:
         '''
         Return whether resource_id is a user assigned managed identity
         '''
@@ -4486,7 +4181,7 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
         return azrid and azrid_is(azrid, AzResourceId, **cls.UAMI_AZRID_VALUES)
 
     @classmethod
-    def user_assigned_identity_resource_type(cls):
+    def user_assigned_identity_resource_type(cls) -> str:
         '''
         Return the resource type string - eg x.type where x is the SDK resource obj.
         '''
@@ -4510,36 +4205,37 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
         subscription_id = subscription_id or self.subscription_id
         name = name or self.managed_identity_name
         if not name:
-            raise ApplicationExit("'managed_identity' not specified")
+            raise self.exc_value("'managed_identity' not specified")
         if name.startswith('/'):
             return self.user_assigned_identity_get_by_id(name)
-        resource_group = resource_group or self.resource_group or self.keyvault_resource_group
+        resource_group = resource_group or self.resource_group
         if not resource_group:
-            raise ApplicationExit("'resource_group' not specified")
-        ret = self._user_assigned_identity_get(subscription_id, resource_group, name)
+            raise self.exc_value("'resource_group' not specified")
+        azrid = self.user_assigned_identity_azrid_build(subscription_id, resource_group, name)
+        ret = self._user_assigned_identity_get(azrid)
         ret = self.user_assigned_identity_obj_normalize(ret)
         return ret
 
-    def _user_assigned_identity_get(self, subscription_id, resource_group, name):
+    def _user_assigned_identity_get(self, azrid):
         '''
         Return azure.mgmt.msi.models.Identity or None
         '''
-        az_msi = self.az_msi_get(subscription_id)
+        az_msi = self._az_msi_get(azrid.subscription_id)
         try:
-            return az_msi.user_assigned_identities.get(resource_group, name)
+            return az_msi.user_assigned_identities.get(azrid.resource_group_name, azrid.resource_name)
         except Exception as exc:
             caught = laaso.msapicall.Caught(exc)
             if caught.is_missing():
                 return None
             raise
 
-    def user_assigned_identity_get_by_id(self, msi_id):
+    def user_assigned_identity_get_by_id(self, resource_id):
         '''
         Return azure.mgmt.msi.models.Identity or None
         The full resource id will embed the subscription id -- use that instead of self.subscription_id
         '''
-        azrid = self.user_assigned_identity_azrid(msi_id)
-        ret = self._user_assigned_identity_get(azrid.subscription_id, azrid.resource_group_name, azrid.resource_name)
+        azrid = self.user_assigned_identity_azrid(resource_id)
+        ret = self._user_assigned_identity_get(azrid)
         ret = self.user_assigned_identity_obj_normalize(ret)
         return ret
 
@@ -4547,17 +4243,20 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
         '''
         Create or update UAMI. Return azure.mgmt.msi.models.Identity.
         '''
-        return self._user_assigned_identity_create_or_update(resource_group, resource_name, location, tags)
+        azrid = self.user_assigned_identity_azrid_build(self.subscription_id, resource_group, resource_name)
+        return self._user_assigned_identity_create_or_update(azrid, location, tags)
 
-    def _user_assigned_identity_create_or_update(self, resource_group, resource_name, location, tags):
+    def _user_assigned_identity_create_or_update(self, azrid, location, tags):
         '''
         Create or update UAMI. Return azure.mgmt.msi.models.Identity.
         '''
-        poller = self.arm_poller(self.az_msi.user_assigned_identities)
-        ret = self.az_msi.user_assigned_identities.create_or_update(resource_group, resource_name,
-                                                                    location=location,
-                                                                    tags=tags,
-                                                                    polling=poller)
+        az_msi = self._az_msi_get(azrid.subscription_id)
+        poller = self.arm_poller(self._az_msi_client.user_assigned_identities)
+        poller.laaso_min_delay = 10
+        ret = az_msi.user_assigned_identities.create_or_update(azrid.resource_group_name, azrid.resource_name,
+                                                               location=location,
+                                                               tags=tags,
+                                                               polling=poller)
         ret = self.user_assigned_identity_obj_normalize(ret)
         return ret
 
@@ -4566,25 +4265,6 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
 
     _cache_ad_service_principal_by_object_id = CacheIndexer()
     laaso.reset_hooks.append(_cache_ad_service_principal_by_object_id.reset)
-
-    def ad_service_principal_wait(self, object_id, max_wait_secs=300, sleep_secs=0.5):
-        '''
-        Wait for object_id to show up as an AAD service principal.
-        This is useful because after creating a UAMI, it is registered
-        with AAD, but that registration can take some time.
-        Bypass the cache to avoid caching does-not-exist.
-        Return azure.graphrbac.models.ServicePrincipal or None.
-        '''
-        t = time.monotonic()
-        deadline = t + max_wait_secs
-        while t <= deadline:
-            sp = self._ad_service_principal_get_by_object_id(object_id)
-            if sp:
-                return sp
-            if t < deadline:
-                time.sleep(sleep_secs)
-            t = time.monotonic()
-        return None
 
     def ad_service_principal_get_by_object_id(self, object_id):
         '''
@@ -4598,7 +4278,7 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
         Return azure.graphrbac.models.ServicePrincipal or None
         '''
         try:
-            return self.az_graphrbac_mgmt.service_principals.get(object_id)
+            return self._az_graphrbac_mgmt_client.service_principals.get(object_id)
         except Exception as exc:
             caught = laaso.msapicall.Caught(exc)
             if caught.is_missing():
@@ -4623,7 +4303,7 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
         Return azure.graphrbac.models.User or None
         '''
         try:
-            return self.az_graphrbac_mgmt.users.get(upn_or_object_id)
+            return self._az_graphrbac_mgmt_client.users.get(upn_or_object_id)
         except azure.graphrbac.models.GraphErrorException as exc:
             if exc.error.code == 'Request_ResourceNotFound':
                 return None
@@ -4657,7 +4337,7 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
         These semantics correspond to the underlying REST operation.
         See https://docs.microsoft.com/en-us/python/api/azure-graphrbac/azure.graphrbac.operations.objectsoperations?view=azure-python
         '''
-        az_graphrbac_mgmt = self.az_graphrbac_mgmt_get(subscription_id)
+        az_graphrbac_mgmt = self._az_graphrbac_mgmt_get(subscription_id)
         param = {'object_ids' : object_ids}
         if types:
             param['types'] = types
@@ -4691,7 +4371,84 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
             return kc
 
     ######################################################################
+    # resource_tags
+
+    @staticmethod
+    def resource_scope_normalize(scope):
+        '''
+        Given an arbitrary resource scope, return it in azrid form.
+        '''
+        if isinstance(scope, AzAnyResourceId):
+            return scope
+        return azresourceid_from_text(scope)
+
+    def resource_tags_get(self, scope):
+        '''
+        Fetch the tags dict for a resource.
+        scope is the resource ID in either str or azrid form (azrid preferred).
+        Returns the tags for that scope.
+        Returns an empty dict for no tags.
+        Returns None for no-such-resource.
+        '''
+        azrid = self.resource_scope_normalize(scope)
+        ret = self._resource_tags_get(azrid)
+        return ret
+
+    def _resource_tags_get(self, azrid):
+        '''
+        azrid is an arbitrary scope (resource id).
+        Returns the associated tags.
+        '''
+        try:
+            # The subscription_id of the az_resource does not matter; the one from the scope is used.
+            res = self._az_resource_client.tags.get_at_scope(str(azrid)) or dict()
+            tags = res.properties.tags
+            return tags if tags else dict()
+        except Exception as exc:
+            caught = laaso.msapicall.Caught(exc)
+            if caught.is_missing():
+                return None
+            raise
+
+    def resource_tags_update(self, scope, tags, operation=azure.mgmt.resource.resources.models.TagsPatchOperation.MERGE):
+        '''
+        Do an in-place update of the tags for a resource.
+        scope is the resource ID in either str or azrid form (azrid preferred).
+        tags is a dict of tags
+        operation is something from azure.mgmt.resource.resources.models.TagsPatchOperation either as a string or the enum
+        See https://docs.microsoft.com/en-us/rest/api/resources/tags/updateatscope
+        '''
+        azrid = self.resource_scope_normalize(scope)
+        # Whatever the scope is, we insist here on a subscription_id and resource_group.
+        # That is not a requirement of the API. It is a safety
+        # within our own code.
+        if not all(getattr(azrid, x, '') for x in ('subscription_id', 'resource_group_name')):
+            raise ValueError(f"invalid scope {azrid!r}")
+        self._resource_tags_update(azrid, tags, operation)
+
+    def _resource_tags_update(self, scope_azrid, tags, operation):
+        '''
+        Do an in-place update of the tags for a resource.
+        scope_azrid is the resource ID in azrid form
+        tags is a dict of tags
+        operation is something from azure.mgmt.resource.resources.models.TagsPatchOperation either as a string or the enum
+        See laaso.azure_tool.Manager.resource_tags_update()
+        '''
+        parameters = {'operation' : operation,
+                      'properties' : {'tags' : tags},
+                     }
+        # The subscription_id of the _az_resource_client does not matter; the one from the scope is used.
+        self._az_resource_client.tags.update_at_scope(str(scope_azrid), parameters)
+
+    ######################################################################
     # resource_group operations
+
+    @staticmethod
+    def resource_group_azrid(resource_id) -> AzRGResourceId:
+        '''
+        Return resource_id in AzRGResourceId form
+        '''
+        return azrid_normalize(resource_id, AzRGResourceId, dict())
 
     @command.printable
     def resource_group_get(self, resource_group=None):
@@ -4702,8 +4459,23 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
         if not resource_group:
             self.logger.error("'resource_group' not specified")
             raise ApplicationExit(1)
+        azrid = AzRGResourceId(self.subscription_id, resource_group)
+        return self._resource_group_get(azrid)
+
+    def resource_group_get_by_id(self, resource_id):
+        '''
+        Return azure.mgmt.resource.resources.models.ResourceGroup or None
+        '''
+        azrid = self.resource_group_azrid(resource_id)
+        return self._resource_group_get(azrid)
+
+    def _resource_group_get(self, azrid):
+        '''
+        Return azure.mgmt.resource.resources.models.ResourceGroup or None
+        '''
+        az_resource = self._az_resource_get(azrid.subscription_id)
         try:
-            return self.az_resource.resource_groups.get(resource_group)
+            return az_resource.resource_groups.get(azrid.resource_group_name)
         except Exception as exc:
             caught = laaso.msapicall.Caught(exc)
             if caught.is_missing():
@@ -4715,197 +4487,202 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
         '''
         Return a list of azure.mgmt.resource.resources.models.ResourceGroup
         '''
-        return list(self.resource_groups_list_iter_get(subscription_id=subscription_id))
+        subscription_id = subscription_id or self.subscription_id
+        return self._resource_groups_list(subscription_id)
+
+    def _resource_groups_list(self, subscription_id=None) -> list:
+        '''
+        Return a list of azure.mgmt.resource.resources.models.ResourceGroup
+        '''
+        try:
+            az_resource = self._az_resource_get(subscription_id)
+            return list(az_resource.resource_groups.list())
+        except Exception as exc:
+            caught = laaso.msapicall.Caught(exc)
+            if caught.is_missing():
+                return list()
+            raise
 
     @command.printable
     def resource_groups_list_names(self, subscription_id=None):
         '''
         List resource groups in the subscription
         '''
-        return [x.name for x in self.resource_groups_list_iter_get(subscription_id=subscription_id)]
+        return [x.name for x in self.resource_groups_list(subscription_id=subscription_id)]
 
-    def resource_groups_list_iter_get(self, subscription_id=None):
+    @command.printable
+    def resource_groups_list_azrids(self, subscription_id=None):
         '''
-        Return an iterator for resource group objects (azure.mgmt.resource.resources.models.ResourceGroup)
-        '''
-        return self._resource_groups_list_iter_get(subscription_id=subscription_id)
-
-    def _resource_groups_list_iter_get(self, subscription_id=None):
-        '''
-        Return an iterator for resource group objects (azure.mgmt.resource.resources.models.ResourceGroup)
+        List resource groups in the subscription
         '''
         subscription_id = subscription_id or self.subscription_id
-        az_resource = self.az_resource_get(subscription_id)
-        ret = az_resource.resource_groups.list()
-        return ret
+        return [AzRGResourceId(subscription_id, x.name) for x in self.resource_groups_list(subscription_id=subscription_id)]
 
     ######################################################################
     # SDK client properties
 
     @property
-    def az_authorization(self):
+    def _az_authorization_client(self) -> AuthorizationManagementClient:
         '''
-        Getter: self.az_authorization, generated on the first call and then cached
+        Getter: self._az_authorization_client, generated on the first call and then cached
         '''
-        return self._az_client_gen_property('_az_authorization', AuthorizationManagementClient)
+        return self._az_client_gen_property('_az_authorization_cachedclient', AuthorizationManagementClient)
 
     @property
-    def az_compute(self):
+    def _az_compute_client(self) -> ComputeManagementClient:
         '''
-        Getter: self.az_compute, generated on the first call and then cached
+        Getter: self._az_compute_client, generated on the first call and then cached
         '''
-        return self._az_client_gen_property('_az_compute', ComputeManagementClient)
+        return self._az_client_gen_property('_az_compute_cachedclient', ComputeManagementClient)
 
     @property
-    def az_graphrbac_mgmt(self):
+    def _az_graphrbac_mgmt_client(self) -> GraphRbacManagementClient:
         '''
-        Getter: self.az_graphrbac_mgmt, generated on the first call and then cached
+        Getter: self._az_graphrbac_mgmt_client, generated on the first call and then cached
         '''
         # TODO (9042401) Figure out a strategy for handling AAD access
-        client_id = [None] # Force login creds only because chained creds do not seem to work with GraphRbacManagementClient
-        return self._az_client_gen_property('_az_graphrbac_mgmt', GraphRbacManagementClient, client_id=client_id)
+        client_id = [AzCred.LOGIN] # Force login creds only because chained creds do not seem to work with GraphRbacManagementClient
+        return self._az_client_gen_property('_az_graphrbac_mgmt_cachedclient', GraphRbacManagementClient, client_id=client_id)
 
     @property
-    def az_keyvault_mgmt(self):
+    def _az_keyvault_mgmt_client(self) -> KeyVaultManagementClient:
         '''
-        Getter: self.az_keyvault_mgmt, generated on the first call and then cached
+        Getter: self._az_keyvault_mgmt_client, generated on the first call and then cached
         '''
-        return self._az_client_gen_property('_az_keyvault_mgmt', KeyVaultManagementClient)
+        return self._az_client_gen_property('_az_keyvault_mgmt_cachedclient', KeyVaultManagementClient)
 
     @property
-    def az_loganalytics(self):
+    def _az_loganalytics_client(self) -> LogAnalyticsManagementClient:
         '''
-        Getter: self.az_loganalytics, generated on the first call and then cached
+        Getter: self._az_loganalytics, generated on the first call and then cached
         '''
-        return self._az_client_gen_property('_az_loganalytics', LogAnalyticsManagementClient)
+        return self._az_client_gen_property('_az_loganalytics_cachedclient', LogAnalyticsManagementClient)
 
     @property
-    def az_msi(self):
+    def _az_msi_client(self) -> ManagedServiceIdentityClient:
         '''
-        Getter: self.az_msi, generated on the first call and then cached
+        Getter: self._az_msi_client, generated on the first call and then cached
         '''
-        return self._az_client_gen_property('_az_msi', ManagedServiceIdentityClient)
+        return self._az_client_gen_property('_az_msi_cachedclient', ManagedServiceIdentityClient)
 
     @property
-    def az_network(self):
+    def _az_network_client(self) -> NetworkManagementClient:
         '''
-        Getter: self.az_network, generated on the first call and then cached
+        Getter: self._az_network_client, generated on the first call and then cached
         '''
-        return self._az_client_gen_property('_az_network', NetworkManagementClient)
+        return self._az_client_gen_property('_az_network_cachedclient', NetworkManagementClient)
 
     @property
-    def az_resource(self):
+    def _az_resource_client(self) -> ResourceManagementClient:
         '''
-        Getter: self.az_resource, generated on the first call and then cached
+        Getter: self._az_resource_client, generated on the first call and then cached
         ResourceManagementClient is for resource groups
         '''
-        return self._az_client_gen_property('_az_resource', ResourceManagementClient)
+        return self._az_client_gen_property('_az_resource_cachedclient', ResourceManagementClient)
 
     @property
-    def az_resource_graph(self):
+    def _az_storage_client(self) -> StorageManagementClient:
         '''
-        Getter: self.az_resource_graph, generated on the first call and then cached
+        Getter: self._az_storage_client, generated on the first call and then cached
         '''
-        return self._az_client_gen_property('_az_resource_graph', ResourceGraphClient)
+        return self._az_client_gen_property('_az_storage_cachedclient', StorageManagementClient)
 
     @property
-    def az_storage(self):
+    def _az_subscription_client(self) -> SubscriptionClient:
         '''
-        Getter: self.az_storage, generated on the first call and then cached
+        Getter: self._az_subscription_client, generated on the first call and then cached
         '''
-        return self._az_client_gen_property('_az_storage', StorageManagementClient)
-
-    @property
-    def az_subscription(self):
-        '''
-        Getter: self.az_subscription, generated on the first call and then cached
-        '''
-        return self._az_client_gen_property('_az_subscription', SubscriptionClient)
+        return self._az_client_gen_property('_az_subscription_cachedclient', SubscriptionClient)
 
     ######################################################################
     # SDK client get operations
+    # functools.cached_property would be nice here, but that's only in Python 3.8+
 
-    def az_authorization_get(self, subscription_id):
+    def _az_authorization_get(self, subscription_id) -> AuthorizationManagementClient:
         '''
         Get a AuthorizationManagementClient for the given subscription.
         '''
         subscription_id = laaso.subscription_mapper.effective(subscription_id)
         if subscription_id == self.subscription_id:
-            return self.az_authorization
+            return self._az_authorization_client
         return self._az_client_gen_do('authorization', AuthorizationManagementClient, subscription_id=subscription_id)
 
-    def az_compute_get(self, subscription_id):
+    def _az_compute_get(self, subscription_id) -> ComputeManagementClient:
         '''
         Get a ComputeManagementClient for the given subscription.
         '''
         subscription_id = laaso.subscription_mapper.effective(subscription_id)
         if subscription_id == self.subscription_id:
-            return self.az_compute
+            return self._az_compute_client
         return self._az_client_gen_do('compute', ComputeManagementClient, subscription_id=subscription_id)
 
-    def az_graphrbac_mgmt_get(self, subscription_id, client_id=None):
+    def _az_graphrbac_mgmt_get(self, subscription_id, client_id=None) -> GraphRbacManagementClient:
         '''
         Get a GraphRbacManagementClient for the given subscription.
         '''
         subscription_id = laaso.subscription_mapper.effective(subscription_id)
         if subscription_id == self.subscription_id:
-            return self.az_graphrbac_mgmt
+            return self._az_graphrbac_mgmt_client
         # TODO (9042401) Figure out a strategy for handling AAD access
         if not client_id:
             client_id = [None] # Force login creds only because chained creds do not seem to work with GraphRbacManagementClient
         return self._az_client_gen_do('graphrbac_mgmt', GraphRbacManagementClient, subscription_id=subscription_id, client_id=client_id)
 
-    def az_keyvault_mgmt_get(self, subscription_id):
+    def _az_keyvault_mgmt_get(self, subscription_id) -> KeyVaultManagementClient:
         '''
         Get a KeyVaultManagementClient for the given subscription.
         '''
         subscription_id = laaso.subscription_mapper.effective(subscription_id)
         if subscription_id == self.subscription_id:
-            return self.az_keyvault_mgmt
+            return self._az_keyvault_mgmt_client
         return self._az_client_gen_do('keyvault_mgmt', KeyVaultManagementClient, subscription_id=subscription_id)
 
-    def az_loganalytics_get(self, subscription_id):
+    def _az_loganalytics_get(self, subscription_id) -> LogAnalyticsManagementClient:
         '''
-        Getter: self.az_loganalytics, generated on the first call and then cached
+        Get a LogAnalyticsManagementClient for the given subscription.
         '''
         subscription_id = laaso.subscription_mapper.effective(subscription_id)
         if subscription_id == self.subscription_id:
-            return self.az_loganalytics
+            return self._az_loganalytics_client
         return self._az_client_gen_do('loganalytics', LogAnalyticsManagementClient, subscription_id=subscription_id)
 
-    def az_msi_get(self, subscription_id):
+    def _az_msi_get(self, subscription_id) -> ManagedServiceIdentityClient:
         '''
         Get a ManagedServiceIdentityClient given a subscription_id and client id
         if client_id is not specified, try using default azure creds (client_id: default)
         '''
         subscription_id = laaso.subscription_mapper.effective(subscription_id)
         if subscription_id == self.subscription_id:
-            return self.az_msi
+            return self._az_msi_client
         return self._az_client_gen_do('msi', ManagedServiceIdentityClient, subscription_id=subscription_id)
 
-    def az_network_get(self, subscription_id):
+    def _az_network_get(self, subscription_id) -> NetworkManagementClient:
         '''
         Get a NetworkManagementClient given a subscription_id and client id
         if client_id is not specified, try using default azure creds (client_id: default)
         '''
         subscription_id = laaso.subscription_mapper.effective(subscription_id)
         if subscription_id == self.subscription_id:
-            return self.az_network
+            return self._az_network_client
         return self._az_client_gen_do('network', NetworkManagementClient, subscription_id=subscription_id)
 
-    def az_resource_generate(self, subscription_id, client_id=None):
+    def _az_resource_get(self, subscription_id) -> ResourceManagementClient:
         '''
         Get a ResourceManagementClient for the given subscription.
-        Always generates a new client, bypassing any caching.
         '''
         subscription_id = laaso.subscription_mapper.effective(subscription_id)
-        return self._az_client_gen_do('resource', ResourceManagementClient, subscription_id=subscription_id, client_id=client_id)
+        if subscription_id == self.subscription_id:
+            return self._az_resource_client
+        return self._az_client_gen_do('resource', ResourceManagementClient, subscription_id=subscription_id)
 
-    def az_resource_get(self, subscription_id):
+    def _az_storage_get(self, subscription_id) -> StorageManagementClient:
         '''
-        Get a ResourceManagementClient for the given subscription.
+        Get a StorageManagementClient for the given subscription.
         '''
-        return self.az_resource_generate(subscription_id)
+        subscription_id = laaso.subscription_mapper.effective(subscription_id)
+        if subscription_id == self.subscription_id:
+            return self._az_storage_client
+        return self._az_client_gen_do('storage', StorageManagementClient, subscription_id=subscription_id)
 
     ######################################################################
     # SDK client object generation
@@ -4921,11 +4698,17 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
         # auth error handling in _az_client_gen_do_cli().
         return msapiwrap(self.logger, ret)
 
+    # Unit tests force _AZ_CLIENT_GEN_DO_CLI_MOUSETRAP
+    # to True so we can catch cases where UT code
+    # accidently tries to talk to Azure rather than the mocks.
+    _AZ_CLIENT_GEN_DO_CLI_MOUSETRAP = False
+
     def _az_client_gen_do_cli(self, name, client_class, subscription_id=None, client_id=None, max_tries=5):
         '''
         Factory for Azure SDK client of type client_class using CLI creds.
         Do not call this directly; call _az_client_gen_do().
         '''
+        assert not self._AZ_CLIENT_GEN_DO_CLI_MOUSETRAP
         assert max_tries > 0
         subscription_id = subscription_id or self.subscription_id
         for try_num in range(1, max_tries+1):
@@ -5128,7 +4911,8 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
             credentials.append(self._credential_from_spec(AzCred.LOGIN, caller_tag))
             seen.append(None)
 
-        self.logger.debug("%s caller_tag=%s generated %s", self.mth(), caller_tag, seen)
+        if self.debug:
+            self.logger.debug("%s caller_tag=%s generated %s", self.mth(), caller_tag, seen)
 
         if not credentials:
             self.logger.error("%s: no credentials caller_tag=%s client_id %s", self.mth(), caller_tag, client_id)
@@ -5197,33 +4981,40 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
                                  }
 
     @classmethod
-    def managed_image_azrid(cls, resource_id):
+    def managed_image_azrid(cls, resource_id) -> AzResourceId:
         '''
         Return resource_id in AzResourceId form.
         '''
         return azrid_normalize(resource_id, AzResourceId, cls.MANAGED_IMAGE_AZRID_VALUES)
 
+    @classmethod
+    def managed_image_azrid_build(cls, subscription_id, resource_group, resource_name) -> AzResourceId:
+        '''
+        Build azrid
+        '''
+        return AzResourceId.build(subscription_id, resource_group, resource_name, cls.MANAGED_IMAGE_AZRID_VALUES)
+
     @command.printable
-    def managed_image_get(self, subscription_id=None, vm_image_resource_group=None, vm_image_name=None):
+    def managed_image_get(self, subscription_id=None, resource_group=None, vm_image_name=None):
         '''
         Managed image; return azure.mgmt.compute.models.Image or None
         '''
         subscription_id = subscription_id or self.vm_image_subscription_id or self.subscription_id
         if not subscription_id:
             raise self.exc_value("'subscription_id' not specified")
-        vm_image_resource_group = vm_image_resource_group or self.vm_image_resource_group or self.resource_group or laaso.scfg.get('vm_image_resource_group_default', '')
-        if not vm_image_resource_group:
-            raise self.exc_value("'vm_image_resource_group' not specified")
+        resource_group = resource_group or self.resource_group
+        if not resource_group:
+            raise self.exc_value("'resource_group' not specified")
         vm_image_name = vm_image_name or self.vm_image_name
         if not vm_image_name:
             raise self.exc_value("'vm_image_name' not specified for %s" % getframename(0))
-        return self._managed_image_get(subscription_id, vm_image_resource_group, vm_image_name)
+        return self._managed_image_get(subscription_id, resource_group, vm_image_name)
 
     def _managed_image_get(self, subscription_id, resource_group, name):
         '''
         Managed image; return azure.mgmt.compute.models.Image or None
         '''
-        az_compute = self.az_compute_get(subscription_id)
+        az_compute = self._az_compute_get(subscription_id)
         try:
             return az_compute.images.get(resource_group, name)
         except Exception as exc:
@@ -5245,8 +5036,6 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
             toks = tuple(image_id[len(scut):].split('/'))
             if not all(toks):
                 return False
-            if len(toks) == 1:
-                return (laaso.subscription_ids.subscription_default, laaso.scfg.get('vm_image_resource_group_default', '')) + toks
             if len(toks) == 2:
                 return (laaso.subscription_ids.subscription_default,) + toks
             if len(toks) == 3:
@@ -5271,7 +5060,7 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
 
     def managed_image_get_by_toks(self, toks):
         '''
-        toks is the result of gallery_image_id_parse()
+        toks is the result of managed_image_id_parse()
         Return azure.mgmt.compute.models.Image or None.
         '''
         return self._managed_image_get(*toks)
@@ -5284,8 +5073,45 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
         azrid = AzResourceId(subscription_id, resource_group, 'Microsoft.Compute', 'images', name)
         return str(azrid)
 
+    @command.simple
+    def managed_image_list_print(self, **kwargs):
+        '''
+        List available managed images in the resource group or subscription
+        '''
+        resource_group = kwargs.pop('resource_group', '') or self.resource_group
+        if kwargs:
+            raise TypeError("unexpected argument(s) %s" % sorted(kwargs.keys()))
+        if resource_group:
+            image_iter = self._az_compute_client.images.list_by_resource_group(resource_group)
+        else:
+            image_iter = self._az_compute_client.images.list()
+        image_names = ["%s/%s" % (x.id.split('/')[4], x.name) for x in image_iter]
+        image_names.sort()
+        for image_name in image_names:
+            print(image_name)
+
+    def managed_image_create_or_update(self, azrid, params) -> azure.mgmt.compute.models.Image:
+        '''
+        Create or update for managed VM image
+        Returns azure.mgmt.compute.models.Image
+        '''
+        azrid.values_sanity(self.MANAGED_IMAGE_AZRID_VALUES)
+        ret = self._managed_image_create_or_update(azrid, params)
+        return ret
+
+    def _managed_image_create_or_update(self, azrid, params) -> azure.mgmt.compute.models.Image:
+        '''
+        Create or update for managed VM image
+        Returns azure.mgmt.compute.models.Image
+        '''
+        az_compute = self._az_compute_get(azrid.subscription_id)
+        poller = self.arm_poller(az_compute.images)
+        op = az_compute.images.begin_create_or_update(azrid.resource_group_name, azrid.resource_name, params, polling=poller)
+        laaso_lro_wait(op, 'compute.images.create_or_update', self.logger)
+        return op.result()
+
     ######################################################################
-    # gallery image operations
+    # gallery image operations - abstract
 
     def _gallery_image_args_normalize(self, subscription_id, resource_group, gallery_name, image_name):
         '''
@@ -5315,51 +5141,6 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
             return None
         return image_versions[-1]
 
-    def gallery_image_versions_list(self, subscription_id=None, resource_group=None, gallery_name=None, image_name=None, sort=False, include_failed=False):
-        '''
-        Return a list of azure.mgmt.compute.models.GalleryImageVersion
-        If any part of this does not exist, return an empty list. Does not return None.
-        '''
-        subscription_id, resource_group, gallery_name, image_name = self._gallery_image_args_normalize(subscription_id, resource_group, gallery_name, image_name)
-        image_versions = self._gallery_image_versions_list(subscription_id, resource_group, gallery_name, image_name)
-        if not include_failed:
-            image_versions = [x for x in image_versions if x.provisioning_state.lower() == 'succeeded']
-        if sort:
-            try:
-                image_versions.sort(key=lambda x: SemanticVersion.from_text(x.id.split('/')[-1]))
-            except Exception as exc:
-                self.logger.warning("%s.%s: unable to sort image_versions: %r\n%s",
-                                    type(self).__name__, getframename(0), exc, indent_simple([x.id for x in image_versions]))
-                raise
-        return image_versions
-
-    def _gallery_image_versions_list(self, subscription_id, resource_group, gallery_name, image_name):
-        '''
-        Return a list of azure.mgmt.compute.models.GalleryImageVersion
-        If any part of this does not exist, return an empty list. Does not return None.
-        List ordering is arbitrary.
-        Only returns items with provisioning_state Succeeded.
-        '''
-        az_compute = self.az_compute_get(subscription_id=subscription_id)
-        # image_versions is now an instance of msrest.paging.Paged.
-        # Convert it to a list and exclude images that have not completed provisioning.
-        # If there are no versions, or if the image definition or image gallery
-        # do not exist, we still get a Paged object that will yield no items. If the
-        # resource group does not exist, we get an error. Simplify the result
-        # by always returning an empty list, even if the resource group does not exist.
-        # We must expand the list inside the exception check because during expansion
-        # the Paged object will make at least one call.
-        try:
-            image_versions = az_compute.gallery_image_versions.list_by_gallery_image(resource_group, gallery_name, image_name)
-            # Force complete fetch of paged items inside the catch block to handle corner-cases with gallery updates
-            image_versions = list(image_versions)
-        except Exception as exc:
-            caught = laaso.msapicall.Caught(exc)
-            if caught.is_missing():
-                return list()
-            raise
-        return image_versions
-
     @command.printable
     def gallery_image_get(self, subscription_id=None, resource_group=None, gallery_name=None, image_name=None, version=None):
         '''
@@ -5368,24 +5149,11 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
         subscription_id, resource_group, gallery_name, image_name = self._gallery_image_args_normalize(subscription_id, resource_group, gallery_name, image_name)
         if (not version) or (version == 'latest'):
             return self.gallery_image_version_latest(subscription_id, resource_group, gallery_name, image_name)
-        return self._gallery_image_get(subscription_id, resource_group, gallery_name, image_name, version)
+        azrid = self.gallery_image_version_azrid_build(subscription_id, resource_group, gallery_name, image_name, version)
+        return self._gallery_image_version_get(azrid)
 
-    def _gallery_image_get(self, subscription_id, resource_group, gallery_name, image_name, version):
-        '''
-        Return azure.mgmt.compute.models.GalleryImageVersion or None.
-        Caller is responsible for providing version.
-        '''
-        try:
-            az_compute = self.az_compute_get(subscription_id=subscription_id)
-            return az_compute.gallery_image_versions.get(resource_group, gallery_name, image_name, version)
-        except Exception as exc:
-            caught = laaso.msapicall.Caught(exc)
-            if caught.is_missing():
-                return None
-            raise
-
-    @staticmethod
-    def gallery_image_id_parse(image_id):
+    @classmethod
+    def gallery_image_id_parse(cls, image_id):
         '''
         Determine whether image_id looks like a gallery image ID, with or without version.
         Examples:
@@ -5393,9 +5161,6 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
             /subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/SBID-Build-Test/providers/Microsoft.Compute/galleries/cbldtest/images/cbld10-int
             gallery:11111111-1111-1111-1111-111111111111/SBID-Build-Test/cbldtest/cbld10-int/0.1.1600256061
             gallery:11111111-1111-1111-1111-111111111111/SBID-Build-Test/cbldtest/cbld10-int/latest
-            gallery:infra-rg/some-gallery/cbld-devel/latest
-            gallery:some-gallery/cbld-devel/latest
-            gallery:cbld-devel/latest
         Return (subscription_id, resource_group, gallery_name, image_name, version)
         When no version is specified, version is None.
         '''
@@ -5403,36 +5168,22 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
             return None
         scut = 'gallery:'
         if image_id.lower().startswith(scut):
-            toks = tuple(image_id[len(scut):].split('/'))
+            toks = image_id[len(scut):].split('/')
             if not all(toks):
-                return False
-            if len(toks) == 2:
-                return (laaso.subscription_ids.dev_gallery_subscription_id, laaso.scfg.dev_gallery_resource_group, laaso.scfg.dev_gallery_name) + toks
-            if len(toks) == 3:
-                return (laaso.subscription_ids.dev_gallery_subscription_id, laaso.scfg.dev_gallery_resource_group) + toks
-            if len(toks) == 4:
-                return (laaso.subscription_ids.dev_gallery_subscription_id,) + toks
+                return None
             if len(toks) == 5:
-                return toks
+                toks[0] = laaso.subscription_mapper.effective(toks[0])
+                return tuple(toks)
             return None
         try:
-            azrid = AzSub2ResourceId.from_text(image_id,
-                                               provider_name='Microsoft.Compute',
-                                               resource_type='galleries',
-                                               subresource_type='images',
-                                               sub2resource_type='versions',
-                                               exc_value=ValueError)
+            azrid = cls.gallery_image_version_azrid(image_id)
             return (azrid.subscription_id, azrid.resource_group_name, azrid.resource_name, azrid.subresource_name, azrid.sub2resource_name)
-        except ValueError:
+        except EXC_VALUE_DEFAULT:
             pass
         try:
-            azrid = AzSubResourceId.from_text(image_id,
-                                              provider_name='Microsoft.Compute',
-                                              resource_type='galleries',
-                                              subresource_type='images',
-                                              exc_value=ValueError)
+            azrid = cls.gallery_image_definition_azrid(image_id)
             return (azrid.subscription_id, azrid.resource_group_name, azrid.resource_name, azrid.subresource_name, None)
-        except ValueError:
+        except EXC_VALUE_DEFAULT:
             pass
         return None
 
@@ -5454,7 +5205,8 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
         '''
         if (not toks[0]) or (not toks[-1]) or (toks[-1].lower() == 'latest'):
             return self.gallery_image_version_latest(*toks[:-1])
-        return self._gallery_image_get(*toks)
+        azrid = self.gallery_image_version_azrid_build(*toks)
+        return self._gallery_image_version_get(azrid)
 
     @staticmethod
     def gallery_image_id_generate(subscription_id, resource_group, gallery_name, image_name, version=None, exc_value=EXC_VALUE_DEFAULT):
@@ -5487,36 +5239,324 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
                                     exc_value=exc_value)
         return str(azrid)
 
-    def gallery_image_versions_create_or_update(self, resource_group, gallery_name, definition_name, image_version, parameters, subscription_id=None, log_level=logging.INFO, wait=True):
+    ######################################################################
+    # image_gallery (shared image gallery / SIG) operations
+
+    IMAGE_GALLERY_AZRID_VALUES = {'provider_name' : 'Microsoft.Compute',
+                                  'resource_type' : 'galleries',
+                                 }
+
+    @classmethod
+    def image_gallery_azrid(cls, resource_id) -> AzResourceId:
+        '''
+        Return resource_id in AzResourceId form.
+        '''
+        return azrid_normalize(resource_id, AzResourceId, cls.IMAGE_GALLERY_AZRID_VALUES)
+
+    @classmethod
+    def image_gallery_azrid_build(cls, subscription_id, resource_group, resource_name) -> AzResourceId:
+        '''
+        Build azrid
+        '''
+        return AzResourceId.build(subscription_id, resource_group, resource_name, cls.IMAGE_GALLERY_AZRID_VALUES)
+
+    @command.printable
+    def image_gallery_get(self, resource_group=None, gallery_name=None):
+        '''
+        Return azure.mgmt.compute.models.Gallery or None
+        '''
+        resource_group = resource_group or self.resource_group
+        if not resource_group:
+            raise ApplicationExit("'resource_group' not specified")
+        gallery_name = gallery_name or self.gallery_name
+        if not gallery_name:
+            raise ApplicationExit("'gallery_name' not specified")
+        azrid = self.image_gallery_azrid_build(self.subscription_id, resource_group, gallery_name)
+        return self._image_gallery_get(azrid)
+
+    def _image_gallery_get(self, azrid:AzResourceId):
+        '''
+        Return azure.mgmt.compute.models.Gallery or None
+        '''
+        az_compute = self._az_compute_get(azrid.subscription_id)
+        try:
+            return az_compute.galleries.get(azrid.resource_group_name, azrid.resource_name)
+        except Exception as exc:
+            caught = laaso.msapicall.Caught(exc)
+            if caught.is_missing():
+                return None
+            raise
+
+    def image_gallery_create_or_update(self, resource_group, resource_name, params) -> azure.mgmt.compute.models.Gallery:
+        '''
+        Create or update shared image gallery
+        '''
+        azrid = self.image_gallery_azrid_build(self.subscription_id, resource_group, resource_name)
+        return self._image_gallery_create_or_update(azrid, params)
+
+    def _image_gallery_create_or_update(self, azrid:AzResourceId, params) -> azure.mgmt.compute.models.Gallery:
+        '''
+        Create or update shared image gallery
+        '''
+        az_compute = self._az_compute_get(azrid.subscription_id)
+        poller = self.arm_poller(az_compute.galleries)
+        op = az_compute.galleries.begin_create_or_update(azrid.resource_group_name, azrid.resource_name, params, polling=poller)
+        laaso_lro_wait(op, 'compute.galleries.create_or_update', self.logger)
+        ret = op.result()
+        return ret
+
+    ######################################################################
+    # gallery image definition operations
+
+    GALLERY_IMAGE_DEFINITION_AZRID_VALUES = {'provider_name' : 'Microsoft.Compute',
+                                             'resource_type' : 'galleries',
+                                             'subresource_type' : 'images',
+                                            }
+
+    @classmethod
+    def gallery_image_definition_azrid(cls, resource_id) -> AzSubResourceId:
+        '''
+        Return resource_id in AzSubResourceId form
+        '''
+        return azrid_normalize(resource_id, AzSubResourceId, cls.GALLERY_IMAGE_DEFINITION_AZRID_VALUES)
+
+    @classmethod
+    def gallery_image_definition_azrid_build(cls, subscription_id, resource_group, resource_name, subresource_name) -> AzSubResourceId:
+        '''
+        Build azrid
+        '''
+        return AzSubResourceId.build(subscription_id, resource_group, resource_name, subresource_name, cls.GALLERY_IMAGE_DEFINITION_AZRID_VALUES)
+
+    @command.printable
+    def gallery_image_definition_get(self, resource_group=None, gallery_name=None, definition_name=None):
+        '''
+        Return info for the named image definition - azure.mgmt.compute.models.GalleryImage or None
+        '''
+        resource_group = resource_group or self.resource_group
+        if not resource_group:
+            raise ApplicationExit("'resource_group' not specified")
+        gallery_name = gallery_name or self.gallery_name
+        if not gallery_name:
+            raise ApplicationExit("'gallery_name' not specified")
+        definition_name = definition_name or self.vm_image_name
+        if not definition_name:
+            raise ApplicationExit("'definition_name' not specified")
+        azrid = self.gallery_image_definition_azrid_build(self.subscription_id, resource_group, gallery_name, definition_name)
+        return self._gallery_image_definition_get(azrid)
+
+    def _gallery_image_definition_get(self, azrid:AzSubResourceId):
+        '''
+        Return azure.mgmt.compute.models.GalleryImage or None
+        '''
+        az_compute = self._az_compute_get(azrid.subscription_id)
+        try:
+            return az_compute.gallery_images.get(azrid.resource_group_name, azrid.resource_name, azrid.subresource_name)
+        except Exception as exc:
+            caught = laaso.msapicall.Caught(exc)
+            if caught.is_missing():
+                return None
+            raise
+
+    def gallery_image_definition_create_or_update(self, resource_id, params) -> azure.mgmt.compute.models.GalleryImage:
+        '''
+        Create an image definition in an image gallery
+        '''
+        azrid = self.gallery_image_definition_azrid(resource_id)
+        return self._gallery_image_definition_create_or_update(azrid, params)
+
+    def _gallery_image_definition_create_or_update(self, azrid:AzSubResourceId, params:dict) -> azure.mgmt.compute.models.GalleryImage:
+        '''
+        Create an image definition in an image gallery
+        '''
+        az_compute = self._az_compute_get(azrid.subscription_id)
+        poller = self.arm_poller(az_compute.galleries)
+        op = az_compute.gallery_images.begin_create_or_update(azrid.resource_group_name, azrid.resource_name, azrid.subresource_name, params, polling=poller)
+        laaso_lro_wait(op, 'compute.gallery_images.create_or_update', self.logger)
+        ret = op.result()
+        return ret
+
+    # Default delay bounds for operations that delete
+    # SIGs or their contents.
+    IMAGE_GALLERY_DELETE_DELAY_MIN = 5
+    IMAGE_GALLERY_DELETE_DELAY_MAX = 10
+
+    @command.simple
+    def gallery_image_definition_delete(self, resource_group=None, gallery_name=None, definition_name=None, wait=True):
+        '''
+        Delete the named image definition
+        '''
+        resource_group = resource_group or self.resource_group
+        if not resource_group:
+            raise ApplicationExit("'resource_group' not specified")
+        gallery_name = gallery_name or self.gallery_name
+        if not gallery_name:
+            raise ApplicationExit("'gallery_name' not specified")
+        definition_name = definition_name or self.vm_image_name
+        if not definition_name:
+            raise ApplicationExit("'definition_name' not specified")
+        poller = self.arm_poller(self._az_compute_client.gallery_images)
+        poller.laaso_min_delay = self.IMAGE_GALLERY_DELETE_DELAY_MIN
+        poller.laaso_max_delay = self.IMAGE_GALLERY_DELETE_DELAY_MAX
+        try:
+            op = self._az_compute_client.gallery_images.begin_delete(resource_group, gallery_name, definition_name, polling=poller)
+        except Exception as exc:
+            caught = laaso.msapicall.Caught(exc)
+            if caught.is_missing():
+                return None
+            raise
+        if wait:
+            laaso_lro_wait(op, 'compute.gallery_images.delete', self.logger)
+        return op
+
+    ######################################################################
+    # gallery image version operations
+
+    GALLERY_IMAGE_VERSION_AZRID_VALUES = {'provider_name' : 'Microsoft.Compute',
+                                          'resource_type' : 'galleries',
+                                          'subresource_type' : 'images',
+                                          'sub2resource_type' : 'versions',
+                                         }
+
+    @classmethod
+    def gallery_image_version_azrid(cls, resource_id) -> AzSub2ResourceId:
+        '''
+        Return resource_id in AzSub2ResourceId form
+        '''
+        return azrid_normalize(resource_id, AzSub2ResourceId, cls.GALLERY_IMAGE_VERSION_AZRID_VALUES)
+
+    @classmethod
+    def gallery_image_version_azrid_build(cls, subscription_id, resource_group, resource_name, subresource_name, sub2resource_name) -> AzSub2ResourceId:
+        '''
+        Return resource_id in AzSub2ResourceId form
+        '''
+        return AzSub2ResourceId.build(subscription_id, resource_group, resource_name, subresource_name, sub2resource_name, cls.GALLERY_IMAGE_VERSION_AZRID_VALUES)
+
+    @command.printable
+    def gallery_image_version_delete(self, resource_group=None, gallery_name=None, definition_name=None, version=None, wait=True):
+        '''
+        Delete the named image version (single image under a definition)
+        '''
+        resource_group = resource_group or self.resource_group
+        if not resource_group:
+            raise ApplicationExit("'resource_group' not specified")
+        gallery_name = gallery_name or self.gallery_name
+        if not gallery_name:
+            raise ApplicationExit("'gallery_name' not specified")
+        vm_image_name = definition_name or self.vm_image_name
+        if not vm_image_name:
+            raise ApplicationExit("'vm_image_name' not specified for %s" % getframename(0))
+        vm_image_version = str(version) or self.vm_image_version
+        if not vm_image_version:
+            raise ApplicationExit("'vm_image_version' not specified")
+        poller = self.arm_poller(self._az_compute_client.gallery_image_versions)
+        poller.laaso_min_delay = self.IMAGE_GALLERY_DELETE_DELAY_MIN
+        poller.laaso_max_delay = self.IMAGE_GALLERY_DELETE_DELAY_MAX
+        try:
+            op = self._az_compute_client.gallery_image_versions.begin_delete(resource_group, gallery_name, vm_image_name, vm_image_version, polling=poller)
+        except Exception as exc:
+            caught = laaso.msapicall.Caught(exc)
+            if caught.is_missing():
+                return None
+            raise
+        if wait:
+            laaso_lro_wait(op, 'compute.gallery_image_versions.delete', self.logger)
+        return op
+
+    def _gallery_image_version_get(self, azrid:AzSub2ResourceId):
+        '''
+        Return azure.mgmt.compute.models.GalleryImageVersion or None.
+        Caller is responsible for providing version.
+        '''
+        try:
+            az_compute = self._az_compute_get(azrid.subscription_id)
+            return az_compute.gallery_image_versions.get(azrid.resource_group_name, azrid.resource_name, azrid.subresource_name, azrid.sub2resource_name)
+        except Exception as exc:
+            caught = laaso.msapicall.Caught(exc)
+            if caught.is_missing():
+                return None
+            raise
+
+    def gallery_image_versions_list(self, subscription_id=None, resource_group=None, gallery_name=None, image_name=None, sort=False, include_failed=False):
+        '''
+        Return a list of azure.mgmt.compute.models.GalleryImageVersion
+        If any part of this does not exist, return an empty list. Does not return None.
+        '''
+        subscription_id, resource_group, gallery_name, image_name = self._gallery_image_args_normalize(subscription_id, resource_group, gallery_name, image_name)
+        image_versions = self._gallery_image_versions_list(subscription_id, resource_group, gallery_name, image_name)
+        if not include_failed:
+            image_versions = [x for x in image_versions if x.provisioning_state.lower() == 'succeeded']
+        if sort:
+            try:
+                image_versions.sort(key=lambda x: SemanticVersion.from_text(x.id.split('/')[-1]))
+            except Exception as exc:
+                self.logger.warning("%s.%s: unable to sort image_versions: %r\n%s",
+                                    type(self).__name__, getframename(0), exc, indent_simple([x.id for x in image_versions]))
+                raise
+        return image_versions
+
+    def _gallery_image_versions_list(self, subscription_id, resource_group, gallery_name, image_name):
+        '''
+        Return a list of azure.mgmt.compute.models.GalleryImageVersion
+        If any part of this does not exist, return an empty list. Does not return None.
+        List ordering is arbitrary.
+        Only returns items with provisioning_state Succeeded.
+        '''
+        az_compute = self._az_compute_get(subscription_id)
+        # image_versions is now an instance of msrest.paging.Paged.
+        # Convert it to a list and exclude images that have not completed provisioning.
+        # If there are no versions, or if the image definition or image gallery
+        # do not exist, we still get a Paged object that will yield no items. If the
+        # resource group does not exist, we get an error. Simplify the result
+        # by always returning an empty list, even if the resource group does not exist.
+        # We must expand the list inside the exception check because during expansion
+        # the Paged object will make at least one call.
+        try:
+            image_versions = az_compute.gallery_image_versions.list_by_gallery_image(resource_group, gallery_name, image_name)
+            # Force complete fetch of paged items inside the catch block to handle corner-cases with gallery updates
+            image_versions = list(image_versions)
+        except Exception as exc:
+            caught = laaso.msapicall.Caught(exc)
+            if caught.is_missing():
+                return list()
+            raise
+        return image_versions
+
+    # We are previewing CopyV2, a feature that enables faster image copies/replication.
+    # This is enabled on a per-gallery_image_version basis. This setting controls
+    # whether we enable it in gallery_image_version_create_or_update().
+    # When the feature is GA, this code may be removed.
+    # See https://msazure.visualstudio.com/One/_workitems/edit/8682992
+    COPYV2_ENABLE = True
+    COPYV2_KEY = 'CopyFlag'
+    COPYV2_VALUE = 'CopyV2'
+
+    def gallery_image_version_create_or_update(self, azrid:AzSub2ResourceId, parameters) -> azure.mgmt.compute.models.GalleryImageVersion:
         '''
         Perform a gallery image version create_or_update using the given parameters.
         If wait is set, the operation completes and the result is returned.
         If wait is not set, the operation is launched and the LRO object is returned.
         Pass None for log_level to suppress logging for non-error paths.
         '''
-        subscription_id = subscription_id or self.subscription_id
-        if isinstance(image_version, SemanticVersion):
-            image_version = str(image_version)
-        image_id = self.gallery_image_id_generate(subscription_id, resource_group, gallery_name, definition_name, image_version)
-        az_compute = self.az_compute_get(subscription_id=subscription_id)
-        if log_level is not None:
-            self.logger.log(log_level, "create image %s with parameters:\n%s", image_id, expand_item_pformat(parameters))
-        try:
-            poller = self.arm_poller(az_compute.gallery_image_versions)
-            op = az_compute.gallery_image_versions.begin_create_or_update(resource_group, gallery_name, definition_name, image_version, parameters, polling=poller)
-            if not wait:
-                return op
-            op.wait()
-            res = op.result()
-        except Exception as exc:
-            caught = laaso.msapicall.Caught(exc)
-            if caught.is_missing():
-                self.logger.error("cannot create image %s: %r", image_id, exc)
-            else:
-                self.logger.error("cannot create image %s: %r:\n%s", image_id, exc, expand_item_pformat(exc, noexpand_types=AZURE_NOEXPAND_TYPES))
-            raise ApplicationExit("cannot create image %s: %r" % (image_id, exc)) from exc
-        if log_level is not None:
-            self.logger.log(log_level, "create %s result:\n%s", image_id, expand_item_pformat(res))
+        parameters = dict(parameters)
+        tags = dict(parameters.setdefault('tags', dict()))
+        parameters['tags'] = tags
+        if self.COPYV2_ENABLE:
+            tags[self.COPYV2_KEY] = self.COPYV2_VALUE
+        else:
+            tags.pop(self.COPYV2_KEY, None)
+        return self._gallery_image_version_create_or_update(azrid, parameters)
+
+    def _gallery_image_version_create_or_update(self, azrid:AzSub2ResourceId, parameters) -> azure.mgmt.compute.models.GalleryImageVersion:
+        '''
+        Perform a gallery image version create_or_update using the given parameters.
+        '''
+        az_compute = self._az_compute_get(azrid.subscription_id)
+        poller = self.arm_poller(az_compute.gallery_image_versions)
+        poller.laaso_min_delay = 30
+        poller.laaso_max_delay = None
+        op = az_compute.gallery_image_versions.begin_create_or_update(azrid.resource_group_name, azrid.resource_name, azrid.subresource_name, azrid.sub2resource_name, parameters, polling=poller)
+        laaso_lro_wait(op, 'compute.gallery_image_versions.create_or_update', self.logger)
+        res = op.result()
         return res
 
     ######################################################################
@@ -5545,7 +5585,6 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
         Return it as azure.mgmt.compute.models.VirtualMachineImage
         Return None for no-such-anything.
         '''
-        # This is a unit testing hook; in production ASSUME_LATEST_IMAGE_VERSION is never set
         image_versions = self.marketplace_image_versions_list(location=location, publisher=publisher, offer=offer, sku=sku, sort=True)
         if not image_versions:
             return None
@@ -5571,20 +5610,18 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
         List ordering is arbitrary.
         '''
         # image_versions is now an instance of msrest.paging.Paged.
-        # If there are no versions, or if the image definition or image gallery
-        # do not exist, we still get a Paged object that will yield no items. If the
-        # resource group does not exist, we get an error. Simplify the result
+        # If there are no versions we still get a Paged object that will yield no items.
+        # If the resource group does not exist, we get an error. Simplify the result
         # by always returning an empty list, even if the resource group does not exist.
         # We must expand the list inside the exception check because during expansion
         # the Paged object will make at least one call.
         try:
-            image_versions = self.az_compute.virtual_machine_images.list(location, publisher, offer, sku)
+            return list(self._az_compute_client.virtual_machine_images.list(location, publisher, offer, sku))
         except Exception as exc:
             caught = laaso.msapicall.Caught(exc)
             if caught.is_missing():
                 return list()
             raise
-        return image_versions
 
     def marketplace_image_get(self, location=None, publisher=None, offer=None, sku=None, version=None):
         '''
@@ -5602,7 +5639,7 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
         Caller is responsible for providing version.
         '''
         try:
-            return self.az_compute.virtual_machine_images.get(location, publisher, offer, sku, version)
+            return self._az_compute_client.virtual_machine_images.get(location, publisher, offer, sku, version)
         except Exception as exc:
             caught = laaso.msapicall.Caught(exc)
             if caught.is_missing():
@@ -5637,7 +5674,7 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
         toks = cls._image_id_tokenize(image_id, expect)
         if not (toks and all(toks[1:])):
             return None
-        if not cls.subscription_id_valid(laaso.subscription_mapper.effective(toks[2])):
+        if not subscription_id_valid(laaso.subscription_mapper.effective(toks[2])):
             return None
         if len(toks) not in (15, 17):
             return None
@@ -5691,6 +5728,48 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
             return tmpl.format(subscription_id=self.subscription_id, location=location, publisher=publisher, offer=offer, sku=sku, version=version)
         tmpl = '/Subscriptions/{subscription_id}/Providers/Microsoft.Compute/Locations/{location}/Publishers/{publisher}/ArtifactTypes/VMImage/Offers/{offer}/Skus/{sku}'
         return tmpl.format(subscription_id=self.subscription_id, location=location, publisher=publisher, offer=offer, sku=sku)
+
+    @command.simple
+    def marketplace_image_list_publishers_print(self):
+        '''
+        List available image publishers
+        '''
+        xs = self._az_compute_client.virtual_machine_images.list_publishers(self.location)
+        xs.sort(key=lambda x: x.name)
+        names = [x.name for x in xs]
+        for name in names:
+            print(name)
+
+    @command.simple
+    def marketplace_image_list_offers_print(self):
+        '''
+        List available offers from self.publisher
+        '''
+        if not self.publisher:
+            self.logger.error("'publisher' not specified")
+            raise ApplicationExit(1)
+        xs = self._az_compute_client.virtual_machine_images.list_offers(self.location, self.publisher)
+        xs.sort(key=lambda x: x.name)
+        names = [x.name for x in xs]
+        for name in names:
+            print(name)
+
+    @command.simple
+    def marketplace_image_list_skus_print(self):
+        '''
+        List available skus from self.publisher/self.offer
+        '''
+        if not self.publisher:
+            self.logger.error("'publisher' not specified")
+            raise ApplicationExit(1)
+        if not self.offer:
+            self.logger.error("'offer' not specified")
+            raise ApplicationExit(1)
+        xs = self._az_compute_client.virtual_machine_images.list_skus(self.location, self.publisher, self.offer)
+        xs.sort(key=lambda x: x.id)
+        names = [x.name for x in xs]
+        for name in names:
+            print(name)
 
     ######################################################################
     # all-purpose image operations
@@ -5802,7 +5881,7 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
         assert isinstance(name, str)
         assert isinstance(image_id, str)
         with self._image_map_lock:
-            if name in laaso.scfg.image_shortcuts:
+            if name in laaso.scfg.get('image_shortcuts', dict()):
                 raise exc_value("%s.%s attempt to map shortcut %r to %r" % (type(self).__name__, getframename(0), name, image_id))
             prev = self._image_map_dict.setdefault(name, image_id)
             if prev != image_id:
@@ -5954,7 +6033,6 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
 
     ######################################################################
     # dedicated-host group and dedicated host wrappers
-    #
 
     def dedicated_host_group_create(self, dh_rg, dh_group_name, dh_group_params):
         '''
@@ -5967,7 +6045,7 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
         wrapper around DedicatedHostGroupsOperations create_or_update
         '''
         try:
-            az_compute = self.az_compute_get(subscription_id)
+            az_compute = self._az_compute_get(subscription_id)
             res = az_compute.dedicated_host_groups.begin_create_or_update(dh_rg, dh_group_name, dh_group_params)
         except Exception as exc:
             caught = laaso.msapicall.Caught(exc)
@@ -5999,7 +6077,7 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
         wrapper around DedicatedHostGroupsOperations get
         '''
         try:
-            az_compute = self.az_compute_get(subscription_id)
+            az_compute = self._az_compute_get(subscription_id)
             return az_compute.dedicated_host_groups.get(resource_group, dh_group_name, expand='instanceView')
         except Exception as exc:
             caught = laaso.msapicall.Caught(exc)
@@ -6018,10 +6096,10 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
         wrapper around DedicatedHostOperations create_or_update
         '''
         try:
-            az_compute = self.az_compute_get(subscription_id)
+            az_compute = self._az_compute_get(subscription_id)
             poller = self.arm_poller(az_compute.dedicated_hosts)
             op = az_compute.dedicated_hosts.begin_create_or_update(dh_rg, dh_group_name, dh_name, dh_params, polling=poller)
-            op.wait()
+            laaso_lro_wait(op, 'compute.dedicated_hosts.create_or_update', self.logger)
             res = op.result()
         except Exception as exc:
             caught = laaso.msapicall.Caught(exc)
@@ -6055,7 +6133,7 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
         wrapper around DedicatedHostOperations get
         '''
         try:
-            az_compute = self.az_compute_get(subscription_id)
+            az_compute = self._az_compute_get(subscription_id)
             return az_compute.dedicated_hosts.get(resource_group, dh_group_name, dh_name, expand='instanceView')
         except Exception as exc:
             caught = laaso.msapicall.Caught(exc)
@@ -6066,33 +6144,42 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
     ######################################################################
     # vm_extension wrappers
 
-    def vm_extension_create(self, vm_rg, vm_name, vm_extension_name, vm_ext_parameters):
+    VMEXT_AZRID_VALUES = {'provider_name' : 'Microsoft.Compute',
+                          'resource_type' : 'virtualMachines',
+                          'subresource_type' : 'extensions',
+                         }
+
+    @classmethod
+    def vm_extension_azrid(cls, resource_id) -> AzSubResourceId:
+        '''
+        Return resource_id in AzSubResourceId form.
+        '''
+        return azrid_normalize(resource_id, AzSubResourceId, cls.VMEXT_AZRID_VALUES)
+
+    @classmethod
+    def vm_extension_azrid_build(cls, subscription_id, resource_group, resource_name, subresource_name) -> AzSubResourceId:
+        '''
+        Build azrid
+        '''
+        return AzSubResourceId.build(subscription_id, resource_group, resource_name, subresource_name, cls.VMEXT_AZRID_VALUES)
+
+    def vm_extension_create_or_update(self, resource_id, params) -> azure.mgmt.compute.models.VirtualMachineExtension:
         '''
         wrapper around _vm_extension_create which is mocked in managermock
         '''
-        return self._vm_extension_create(self.subscription_id, vm_rg, vm_name, vm_extension_name, vm_ext_parameters)
+        azrid = self.vm_extension_azrid(resource_id)
+        return self._vm_extension_create(azrid, params)
 
-    def _vm_extension_create(self, subscription_id, vm_rg, vm_name, vm_extension_name, vm_ext_parameters):
+    def _vm_extension_create(self, azrid:AzSubResourceId, params) -> azure.mgmt.compute.models.VirtualMachineExtension:
         '''
         Wrapper around vm_extension create_or_update
         '''
-        try:
-            az_compute = self.az_compute_get(subscription_id)
-            poller = self.arm_poller(az_compute.virtual_machine_extensions)
-            op = az_compute.virtual_machine_extensions.begin_create_or_update(vm_rg, vm_name, vm_extension_name, vm_ext_parameters, polling=poller)
-            op.wait()
-            res = op.result()
-        except Exception as exc:
-            caught = laaso.msapicall.Caught(exc)
-            if caught.is_missing():
-                self.logger.error("cannot create extension %r in VM %r: %r", vm_extension_name, vm_name, exc)
-            else:
-                self.logger.error("cannot create extension %r in VM %r: %r:\n%s",
-                                  vm_extension_name, vm_name, exc, expand_item_pformat(exc, noexpand_types=AZURE_NOEXPAND_TYPES))
-            raise ApplicationExit("cannot create extension %r in VM %r" % (vm_extension_name, vm_name)) from exc
-        if self.debug > 0:
-            self.logger.debug("VM Extension Op Result:\n%s", expand_item_pformat(res))
-        return res
+        az_compute = self._az_compute_get(azrid.subscription_id)
+        poller = self.arm_poller(az_compute.virtual_machine_extensions)
+        poller.laaso_min_delay = 10
+        op = az_compute.virtual_machine_extensions.begin_create_or_update(azrid.resource_group_name, azrid.resource_name, azrid.subresource_name, params, polling=poller)
+        laaso_lro_wait(op, 'compute.virtual_machine_extensions.create_or_update', self.logger)
+        return op.result()
 
     def vm_extension_get(self, vm_name, vm_extension_name, resource_group=None, subscription_id=None):
         '''
@@ -6110,7 +6197,7 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
         Return azure.mgmt.compute.models.VirtualMachineExtension or None
         '''
         try:
-            az_compute = self.az_compute_get(subscription_id)
+            az_compute = self._az_compute_get(subscription_id)
             return az_compute.virtual_machine_extensions.get(vm_rg, vm_name, vm_extension_name)
         except Exception as exc:
             caught = laaso.msapicall.Caught(exc)
@@ -6121,64 +6208,287 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
     ######################################################################
     # VM mgmt
 
-    def vm_update(self, vm_rg, vm_name, vm_parameters,
-                  log_level=logging.INFO,
-                  opname='',
-                  reissue=None,
-                  wait_error=None):
+    VM_AZRID_VALUES = {'provider_name' : 'Microsoft.Compute',
+                       'resource_type' : 'virtualMachines',
+                      }
+
+    @classmethod
+    def vm_azrid(cls, resource_id) -> AzResourceId:
         '''
-        Do the work to issue and wait for a VM update to complete.
-        reissue is a callout invoked when the operation must be reissued for any reason.
-        wait_error is a callout invoked when the LRO poller wait() fails. This is invoked in the exception context.
+        Return resource_id in AzResourceId form.
         '''
-        reissue = reissue or (lambda *args: None)
-        wait_error = wait_error or (lambda *args: None)
-        vm_op = None
-        time0 = time.time()
-        do_reissue = True
-        verb = 'begin'
-        prefix = opname.rstrip()
-        if prefix:
-            prefix += ' '
+        return azrid_normalize(resource_id, AzResourceId, cls.VM_AZRID_VALUES)
+
+    @classmethod
+    def vm_azrid_build(cls, subscription_id, resource_group, resource_name) -> AzResourceId:
+        '''
+        Build azrid
+        '''
+        return AzResourceId.build(subscription_id, resource_group, resource_name, cls.VM_AZRID_VALUES)
+
+    @classmethod
+    def is_vm_resource_id(cls, resource_id) -> bool:
+        '''
+        Return whether resource_id is a VM resource_id
+        '''
+        azrid = azrid_normalize_or_none(resource_id, AzResourceId, cls.VM_AZRID_VALUES)
+        return azrid and azrid_is(azrid, AzResourceId, **cls.VM_AZRID_VALUES)
+
+    @classmethod
+    def vm_obj_normalize(cls, obj:azure.mgmt.compute.models.VirtualMachine) -> azure.mgmt.compute.models.VirtualMachine:
+        '''
+        Canonize the contents of one azure.mgmt.compute.models.VirtualMachine.
+        Deal with inconsistent case for UAMIs.
+        '''
+        if obj and obj.identity and obj.identity.user_assigned_identities:
+            # obj.identity.user_assigned_identities is a dict where the keys are resource IDs.
+            # Generate a dict where the keys are normalized.
+            repl = {str(cls.user_assigned_identity_azrid(k)) : v for k, v in obj.identity.user_assigned_identities.items()}
+            obj.identity.user_assigned_identities = repl
+        return obj
+
+    def vm_get(self, vm_name, resource_group=None, subscription_id=None):
+        '''
+        Retrieve VM info. Returns None if no such VM.
+        '''
+        resource_group = resource_group or self.vm_resource_group
+        if not resource_group:
+            raise ApplicationExit("'resource_group' not specified")
+        subscription_id = subscription_id or self.subscription_id
+        azrid = self.vm_azrid_build(subscription_id, resource_group, vm_name)
+        ret = self._vm_get(azrid)
+        return self.vm_obj_normalize(ret)
+
+    def vm_get_by_id(self, vm_id):
+        '''
+        Given vm_id as resource_id str or AzResourceId, return azure.mgmt.compute.models.VirtualMachine or None
+        '''
+        azrid = self.vm_azrid(vm_id)
+        ret = self._vm_get(azrid)
+        return self.vm_obj_normalize(ret)
+
+    def _vm_get(self, azrid):
+        '''
+        Return azure.mgmt.compute.models.VirtualMachine or None
+        '''
+        try:
+            az_compute = self._az_compute_get(azrid.subscription_id)
+            return az_compute.virtual_machines.get(azrid.resource_group_name, azrid.resource_name, expand='instanceView')
+        except Exception as exc:
+            caught = laaso.msapicall.Caught(exc)
+            if caught.is_missing():
+                return None
+            raise
+
+    def vm_create_or_update(self, azrid, params) -> azure.mgmt.compute.models.VirtualMachine:
+        '''
+        Create or update virtual machine
+        '''
+        azrid.values_sanity(self.VM_AZRID_VALUES)
+        ret = self._vm_create_or_update(azrid, params)
+        ret = self.vm_obj_normalize(ret)
+        return ret
+
+    def _vm_create_or_update(self, azrid, params) -> azure.mgmt.compute.models.VirtualMachine:
+        '''
+        Create or update virtual machine
+        '''
+        az_compute = self._az_compute_get(azrid.subscription_id)
+        poller = self.arm_poller(az_compute.virtual_machines)
+        poller.laaso_min_delay = 15
+        poller.laaso_max_delay = 30
+        op = az_compute.virtual_machines.begin_create_or_update(azrid.resource_group_name, azrid.resource_name, params, polling=poller)
+        laaso_lro_wait(op, 'compute.virtual_machines.create_or_update', self.logger)
+        return op.result()
+
+    def vm_delete(self, vm_name, resource_group=None, wait=True, verbose=True):
+        '''
+        Delete VM after resource group check
+        '''
+        resource_group = resource_group or self.vm_resource_group
+        if self.vm_get(vm_name, resource_group):
+            return self._vm_delete(resource_group, vm_name, wait, verbose)
+        return None
+
+    # Default delay bounds for vm-stopping operations
+    VM_STOP_DELAY_MIN = 20
+    VM_STOP_DELAY_MAX = 30
+
+    def _vm_delete(self, resource_group, vm_name, wait, verbose):
+        '''
+        VM delete completes asynchronously if wait is set to False.
+        '''
+        try:
+            poller = self.arm_poller(self._az_compute_client.virtual_machines)
+            poller.laaso_min_delay = self.VM_STOP_DELAY_MIN
+            poller.laaso_max_delay = self.VM_STOP_DELAY_MAX
+            op = self._az_compute_client.virtual_machines.begin_delete(resource_group, vm_name, polling=poller)
+            if verbose:
+                self.logger.info("delete virtual machine %s operation_id %r", vm_name, self.polling_op_operation_id(op))
+            if wait:
+                self.vm_delete_op_wait(vm_name, op, verbose)
+        except Exception as exc:
+            caught = laaso.msapicall.Caught(exc)
+            if caught.is_missing():
+                if verbose:
+                    self.logger.info("virtual machine %s does not exist", vm_name)
+                return None
+            self.logger.warning("cannot delete virtual machine %r [%s]: %r", vm_name, caught.reason(), exc)
+            raise
+        return op
+
+    def vm_delete_op_wait(self, vm_name, op, verbose):
+        '''
+        wait for VM delete operation to complete
+        '''
+        if verbose:
+            self.logger.info("wait for virtual machines %s delete", vm_name)
+        laaso_lro_wait(op, 'compute.virtual_machines.delete', self.logger)
+        if verbose:
+            self.logger.info("virtual machine %s deleted", vm_name)
+
+    def vm_power_off(self, vm_resource_group, vm_name):
+        '''
+        Stop (power off) a VM. This does not deallocate it.
+        '''
+        if not vm_resource_group:
+            raise ApplicationExit("'vm_resource_group' not specified")
+        if not vm_name:
+            raise ApplicationExit("'vm_name' not specified")
         while True:
-            if (not vm_op) or do_reissue:
-                if vm_op:
-                    reissue(vm_rg, vm_name, vm_parameters)
-                verb = 'begin'
-                poller = self.arm_poller(self.az_compute.virtual_machines)
-                vm_op = self.az_compute.virtual_machines.begin_update(vm_rg, vm_name, vm_parameters, polling=poller)
-            else:
-                verb = 'resume'
-                if self.op_resume_debug:
-                    thread_info = [[thread.name, thread, traceback.format_stack(sys._current_frames()[thread.ident])] for thread in threading.enumerate()] # pylint: disable=protected-access
-                    self.logger.log(log_level, "%s%s thread=%s threads:\n%s",
-                                    prefix, verb, laaso.msapicall.op_thread_get(vm_op),
-                                    expand_item_pformat(thread_info))
-            do_reissue = True
-            if vm_op.done():
-                self.logger.log(log_level, "%sop %s done with status %s", prefix, type(vm_op), vm_op.status())
-                break
-            if elapsed(time0) < 300:
-                timeout = 60
-            elif elapsed(time0) < 1800:
-                timeout = 300
-            else:
-                timeout = None
-            self.logger.log(log_level, "%sop %s %s waiting with status %r", prefix, self.polling_op_operation_id(vm_op), verb, vm_op.status())
-            try:
-                vm_op.wait(timeout=timeout)
-                if vm_op.done():
-                    break
-                do_reissue = False
-            except Exception as exc:
-                self.logger.warning("%swait op %s wait failure %r", prefix, self.polling_op_operation_id(vm_op), exc)
-                wait_error(vm_rg, vm_name, vm_parameters, exc)
-        self.logger.log(log_level, "%sop %s %s done waiting", prefix, type(vm_op).__name__, self.polling_op_operation_id(vm_op))
-        res = vm_op.result()
-        return res
+            poller = self.arm_poller(self._az_compute_client.virtual_machines)
+            poller.laaso_min_delay = self.VM_STOP_DELAY_MIN
+            poller.laaso_max_delay = self.VM_STOP_DELAY_MAX
+            power_off_op = self._az_compute_client.virtual_machines.begin_power_off(vm_resource_group, vm_name, polling=poller)
+            power_off_operation_id = self.polling_op_operation_id(power_off_op)
+            self.logger.info("VM %r power_off wait operation_id=%s", vm_name, power_off_operation_id)
+            laaso_lro_wait(power_off_op, 'compute.virtual_machines.power_off', self.logger)
+            power_off_res = power_off_op.result()
+            self.logger.info("VM %r power_off operation_id=%s result:\n%s", vm_name, power_off_operation_id, expand_item_pformat(power_off_res))
+            vm_obj = self.vm_get(vm_name, resource_group=vm_resource_group)
+            if not vm_obj:
+                self.logger.error("VM %r disappeared following power off operation_id=%s", vm_name, power_off_operation_id)
+                raise ApplicationExit("VM %r disappeared following power off" % vm_name)
+            if not vm_obj.instance_view:
+                self.logger.warning("VM %r has no instance_view following power off operation_id=%s (will retry)", vm_name, power_off_operation_id)
+                continue
+            if not vm_obj.instance_view.statuses:
+                self.logger.warning("VM %r instance_view has no statuses following power off operation_id=%s (will retry)", vm_name, power_off_operation_id)
+                continue
+            status_code = vm_obj.instance_view.statuses[-1].code
+            if status_code != 'PowerState/stopped':
+                self.logger.warning("VM %r completed power_off operation_id=%s but has status %r",
+                                    vm_name, power_off_operation_id, status_code)
+                continue
+            # VM is stopped
+            break
+        self.logger.info("VM %r status %r following power off", vm_name, status_code)
+
+    def vm_generalize(self, vm_resource_group, vm_name):
+        '''
+        Generalize the named VM
+        '''
+        generalize_res = self._az_compute_client.virtual_machines.generalize(vm_resource_group, vm_name)
+        self.logger.info("VM %r generalize result:\n%s", vm_name, expand_item_pformat(generalize_res))
+
+    @command.printable
+    def vm_list(self, subscription_id=None, resource_group=None):
+        '''
+        List virtual machines in a subscription. If not specified explicitly, self.subscription_id is used.
+        May optionally limit to a resource_group.
+        Return a list of azure.mgmt.compute.models.VirtualMachine
+        '''
+        subscription_id = laaso.subscription_mapper.effective(subscription_id or self.subscription_id)
+        resource_group = resource_group or None
+        ret = self._vm_list(subscription_id, resource_group)
+        return [self.vm_obj_normalize(vm) for vm in ret]
+
+    def _vm_list(self, subscription_id, resource_group):
+        '''
+        List virtual machines in a subscription.
+        If resource_group is truthy, restrict the list to the named RG.
+        Return a list of azure.mgmt.compute.models.VirtualMachine
+        '''
+        az_compute = self._az_compute_get(subscription_id)
+        try:
+            if resource_group:
+                return list(az_compute.virtual_machines.list(resource_group))
+            return list(az_compute.virtual_machines.list_all())
+        except Exception as exc:
+            caught = laaso.msapicall.Caught(exc)
+            if caught.is_missing():
+                return list()
+            raise
+
+    def vm_update(self, azrid, params) -> azure.mgmt.compute.models.VirtualMachine:
+        '''
+        Update an existing VM with the given params
+        '''
+        ret = self._vm_update(azrid, params)
+        ret = self.vm_obj_normalize(ret)
+        return ret
+
+    def _vm_update(self, azrid, params) -> azure.mgmt.compute.models.VirtualMachine:
+        '''
+        Update an existing VM with the given params
+        '''
+        az_compute = self._az_compute_get(azrid.subscription_id)
+        poller = self.arm_poller(az_compute.virtual_machines)
+        poller.laaso_min_delay = None
+        poller.laaso_max_delay = 30
+        op = az_compute.virtual_machines.begin_update(azrid.resource_group_name, azrid.resource_name, params, polling=poller)
+        laaso_lro_wait(op, 'compute.virtual_machines.update', self.logger)
+        return op.result()
 
     ######################################################################
     # VM other
+
+    def vm_primary_nic_addr_get(self, vm_info):
+        '''
+        Extract the primary network address from vm_info as returned by vm_get()
+        '''
+        if len(vm_info.network_profile.network_interfaces) == 1:
+            # Special case; not always marked as primary
+            nic = vm_info.network_profile.network_interfaces[0]
+        else:
+            for nic in vm_info.network_profile.network_interfaces:
+                if nic.primary:
+                    break
+            else:
+                self.logger.error("No primary NIC for VM %s", vm_info.name)
+                return None
+        nic_info = self.nic_get_by_id(nic.id)
+        if not nic_info:
+            self.logger.warning("VM %s has NIC %s which does not exist", vm_info.id, nic.id)
+            return None
+        config = None
+        for config in nic_info.ip_configurations:
+            if config.primary:
+                return config.private_ip_address
+        self.logger.warning("no primary config found for NIC %s", nic_info.id)
+        return None
+
+    def vm_find(self, vm_name):
+        '''
+        Return a list of VMs found across resource groups for the subscription
+        '''
+        rgs = self.resource_groups_list()
+        ret = list()
+        for rg in rgs:
+            vm = self.vm_get(vm_name, resource_group=rg.name)
+            if vm:
+                ret.append(vm)
+        return ret
+
+    @command.vm_name
+    def vm_find_print(self, vm_name):
+        '''
+        Print IDs of VMs with this name in the subscription
+        '''
+        vms = self.vm_find(vm_name)
+        vms.sort(key=lambda x: x.id)
+        for vm in vms:
+            print(vm.id)
 
     @staticmethod
     def vm_custom_data_encode(data, check_len=True, exc_value=EXC_VALUE_DEFAULT):
@@ -6308,12 +6618,8 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
                               help='name of storage account')
         at_group.add_argument('--subnet_name', type=str, default='',
                               help='name of subnet in vnet')
-        at_group.add_argument('--vm_boot_diags_storage_account', type=str, default='',
-                              help="storage account for VM boot diagnostics")
         at_group.add_argument('--vm_image_name', type=str, default=Manager.VM_IMAGE_NAME_DEFAULT,
                               help='name of image to use for VM creation')
-        at_group.add_argument('--vm_image_resource_group', type=str, default='',
-                              help='resource group of image to use for VM creation')
         at_group.add_argument('--vm_image_version', type=str, default='',
                               help='version of vm_image_name image within gallery')
         at_group.add_argument('--vm_name', type=str, default='',
@@ -6360,9 +6666,7 @@ class Manager(laaso.common.ApplicationWithResourceGroup):
         simple_handlers = ('printable', 'printable_raw', 'simple')
         vm_name_handlers = ('printable_vm_name', 'vm_name')
 
-        if action == 'vm_create':
-            self.vms_create(vm_names)
-        elif self.command.handle(action, simple_handlers, self):
+        if self.command.handle(action, simple_handlers, self):
             pass
         elif self.command.can_handle(action, vm_name_handlers, self, ''):
             for vm_name in vm_names:

@@ -127,7 +127,7 @@ class Redaction():
         return self.key < other.key
 
     def __eq__(self, other):
-        return (self._key == other.key) and (self._value == other._value)
+        return (self._key == other.key) and (self._value == other.value)
 
     def __gt__(self, other):
         if len(self._value) > len(other.value):

@@ -16,6 +16,7 @@ import errno
 import functools
 import inspect
 import ipaddress
+import json
 import logging
 import os
 import pprint
@@ -89,6 +90,12 @@ def getframes(idx):
         f = sys._getframe(i+1) # pylint: disable=protected-access
         frames += "%s:%s:%s\n" % (f.f_code.co_filename, f.f_code.co_name, f.f_lineno)
     return frames
+
+def qstack() -> str:
+    '''
+    Stack in short form str - filename:lineno,filename:lineno,...
+    '''
+    return ','.join([':'.join([fr.filename, str(fr.lineno)]) for fr in traceback.extract_stack()])
 
 def _expand_item_filter(dd,
                         expand_enum,
@@ -906,6 +913,47 @@ def deep_update(orig_dict, new_dict, append_list=False):
             ret[key] = new_dict[key]
     return ret
 
+def deep_unique_keys(data:collections.abc.Mapping, exclude_dict:collections.abc.Mapping) -> dict:
+    '''
+    Given a dict (data), return a copy of that dict where any keys
+    present in another dict (exclude_dict) are not present in
+    the returned copy. In the case where data and exclude dict
+    both contain that same key and for both the corresponding value
+    is a dict, recursively filter using the corresponding values.
+    '''
+    ret = dict(data)
+    for key, val in exclude_dict.items():
+        try:
+            rval = ret[key]
+        except KeyError:
+            continue
+        if isinstance(rval, collections.abc.Mapping) and isinstance(val, collections.abc.Mapping):
+            ret[key] = deep_unique_keys(rval, val)
+            if rval and (not ret[key]):
+                ret.pop(key)
+            continue
+        ret.pop(key)
+    return ret
+
+def deep_included_keys(data:collections.abc.Mapping, include_dict:collections.abc.Mapping) -> dict:
+    '''
+    Given a dict (data), return a copy of that dict where only keys
+    present in another dict (include_dict) are not present in
+    the returned copy. In the case where data and exclude dict
+    both contain that same key and for both the corresponding value
+    is a dict, recursively filter using the corresponding values.
+    '''
+    ret = dict()
+    for key, val in include_dict.items():
+        try:
+            rval = data[key]
+        except KeyError:
+            continue
+        if isinstance(rval, collections.abc.Mapping) and isinstance(val, collections.abc.Mapping):
+            rval = deep_included_keys(rval, val)
+        ret[key] = rval
+    return ret
+
 class LogLevelExcursion():
     '''
     Class that may be used as a context to save and restore the log level on a logger.
@@ -1502,3 +1550,60 @@ def tabulate_lines(*args, **kwargs):
     Wrapper around tabulate.tabulate that returns a list of lines
     '''
     return [x.rstrip() for x in tabulate.tabulate(*args, **kwargs).splitlines()]
+
+def log_level_normalize(log_level, none_ok=False):
+    '''
+    Transform log_level to an integer suitable for the logging module.
+    '''
+    if none_ok and (log_level is None):
+        return None
+    if isinstance(log_level, int):
+        return log_level
+    tmpstr = str(log_level)
+    try:
+        return int(tmpstr)
+    except ValueError:
+        pass
+    for tmp in [tmpstr, tmpstr.upper()]:
+        try:
+            return int(logging._nameToLevel[tmp]) # pylint: disable=protected-access
+        except (AttributeError, KeyError, ValueError):
+            pass
+        try:
+            val = getattr(logging, tmp)
+            if isinstance(val, int):
+                return val
+        except (AttributeError, KeyError, ValueError):
+            pass
+    raise ValueError("cannot interpret %s %r as a log level" % (type(log_level).__name__, log_level))
+
+class GenericJSONEncoder(json.JSONEncoder):
+    '''
+    json.JSONEncoder subclass that understands additional
+    types from standard Python modules.
+    '''
+    def default(self, o):
+        '''
+        The callout to do the encoding.
+        '''
+        if isinstance(o, enum.Enum):
+            return o.value
+        if isinstance(o, uuid.UUID):
+            return str(o)
+        return super().default(o)
+
+def contains_class(obj, kls) -> bool:
+    '''
+    Return whether the given object contains an instance of the
+    given class (may be a tuple of classes). Unrecognized
+    object types considered false.
+    '''
+    if isinstance(obj, kls):
+        return True
+    if isinstance(obj, (bytes, bytearray, float, int, memoryview, str)):
+        return False
+    if isinstance(obj, collections.abc.Mapping):
+        return any(contains_class(x, kls) for x in obj.values())
+    if isinstance(obj, (collections.abc.Generator, collections.abc.Iterable, collections.abc.Iterator, collections.abc.Sequence)):
+        return any(contains_class(x, kls) for x in obj)
+    return False
