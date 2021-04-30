@@ -27,14 +27,7 @@ without the Hierarchical Namespace feature enabled.
 
 The hydrator requires access to an Azure Storage Account (SA) in order to import the
 namespace into Lustre.  Access is provided by means of a Shared Access Signature(SAS)
-token.  In order to keep the SAS token secure, the token is kept in an Azure Key Vault.
-Access to the Key Vault is controlled via a Managed Identity, which is assigned to the
-VM on which the hydrator runs.
-
-### Setup the Azure Key Vault
-
-Create an Azure Key Vault.  Ensure that you follow recommended security practices to
-limit subnets that can communicate with the Key Vault.
+token.
 
 ### Generate a SAS token
 
@@ -46,26 +39,6 @@ within the Storage Account if possible, rather than the entire Storage Account.
 If generating a token to be used with the [copytool](https://github.com/wastore/lemur/),
 ensure that `Write` and `Create` are also specified as permissions.
 
-### Put SAS token into the Key Vault
-
-The SAS token to place into the Key Vault should be the one that begins with '?' (the question mark).
-Create a new Secret, and use the SAS token as the value.
-
-### VM Identity
-
-Create a new Identity for the VM.  This can be `System assigned` or `User assigned`.
-
-### Configure RBAC and Access policies of the Key Vault
-
-#### RBAC
-
-Under the `Access Control (IAM)` configuration of the Key Vault, assign the `Key Vault Secrets User`
-permission to the VM Identity.
-
-#### Access policies
-
-Under the `Access policy` configuration of the Key Vault, `Add Access Policy`, and select
-`Get` and `List` for `Secret permissions`.  Select the `VM Identity` where `Select principal` is required.
 
 ## Installing the virtualenv
 
@@ -84,6 +57,7 @@ the directory where you would like the virtual env to be installed.
 VENV=~/hydrator_venv
 REPO_DIR=.
 rm -rf $VENV
+export LAASO_VENV_CREATE_ANSIBLE_GALAXY_REQUIREMENTS=
 python3.7 $REPO_DIR/build/venv_create.py $VENV $REPO_DIR/laaso/requirements.txt
 ```
 
@@ -111,9 +85,9 @@ The examples provided use the following variables:
 the storage account when creating it.
 * *``mycontainer``* refers to the container that you wish to import within
 ``mystorageacct``.
-* *``mysecret``* is the name of the secret in the Key Vault where the SAS token is stored.
-* *``mykv``* is the name of the Key Vault where the SAS token is stored.  This is not the
-  entire URL for the Key Vault (https://mykv.vault.azure.net/).
+* *``mysas``* is a shared access signature (SAS) token generated for
+``mystorageacct`` (starting with the ? character) that includes at least
+read and list permissions on the blobs and containers.
 
 You must place quotes around the SAS token to ensure that it is
 interpreted properly by the command-line parser.
@@ -121,14 +95,14 @@ interpreted properly by the command-line parser.
 To import an entire storage account container into a Lustre mount at /mnt/lustre:
 
 ```bash
-(hydrator_venv)# PYTHONPATH=. laaso/hydrator.py "mystorageacct" "mycontainer" "mysecret" -k -n "mykv" -a /mnt/lustre --lemur
+(hydrator_venv)# PYTHONPATH=. laaso/hydrator.py "mystorageacct" "mycontainer" "mysas" -a /mnt/lustre --lemur
 ```
 
 To do the same as the above, but only import blobs whose names start with
 prefix "some/prefix":
 
 ```bash
-(hydrator_venv)# PYTHONPATH=. laaso/hydrator.py "mystorageacct" "mycontainer" "mysecret" -k -n "mykv" -a /mnt/lustre -p "some/prefix" --lemur
+(hydrator_venv)# PYTHONPATH=. laaso/hydrator.py "mystorageacct" "mycontainer" "mysas" -a /mnt/lustre -p "some/prefix" --lemur
 ```
 
 Note: the --lemur flag is required for compatibility with copytools
